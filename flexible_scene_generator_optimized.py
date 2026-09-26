@@ -15,6 +15,13 @@ import argparse
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
+# Frames the Animated-pack *_Sitting clips take to go from standing to seated.
+SIT_SETTLE_FRAMES = 11
+
+# Frames to cross-fade between consecutive animation segments of a character.
+NLA_BLEND_FRAMES = 4
+
+
 class OptimizedSceneGenerator:
     """Efficient JSON-driven Blender scene generator"""
     
@@ -46,9 +53,12 @@ class OptimizedSceneGenerator:
         if 'settings' in self.config and 'asset_base_path' in self.config['settings']:
             return self.config['settings']['asset_base_path']
         
-        # Auto-detect from config file location
+        # Auto-detect from config file location; JSONs saved in output/ (or elsewhere) fall
+        # back to the repo's own assets/ folder next to this script.
         config_dir = os.path.dirname(os.path.abspath(self.config_path))
-        return config_dir
+        if os.path.isdir(os.path.join(config_dir, "assets")):
+            return config_dir
+        return os.path.dirname(os.path.abspath(__file__))
     
     def _get_blender_path(self) -> str:
         """Get Blender executable path"""
@@ -143,11 +153,22 @@ def _fcurve_bone_name(data_path: str):
         return None
 
 
-def _build_blended_action(armature, upper_action, lower_action, blended_name: str):
+def _action_fcurves(action):
+    """All FCurves of an action — Blender 4.x (legacy) and 5.x (slotted actions)."""
+    if hasattr(action, "fcurves"):
+        return list(action.fcurves)
+    return [fc for layer in action.layers for strip in layer.strips
+            for bag in strip.channelbags for fc in bag.fcurves]
+
+
+def _build_blended_action(armature, upper_action, lower_action, blended_name: str,
+                          lower_loc_scale: float = 1.0):
     """
     Create (or reuse) a merged action:
-      - upper body FCurves come from upper_action
-      - lower body FCurves come from lower_action
+      - upper body FCurves come from upper_action (cycled, so a short gesture
+        loops for the whole segment)
+      - lower body FCurves come from lower_action; its location keys are
+        multiplied by lower_loc_scale when it was authored on a different rig
     The split is determined by the armature's own bone hierarchy so it works
     with any bone-naming convention.
     """
@@ -161,8 +182,26 @@ def _build_blended_action(armature, upper_action, lower_action, blended_name: st
     blended = bpy.data.actions.new(name=blended_name)
     blended.use_fake_user = True
 
+    added = set()
+    _bag = []  # Blender 5.x channelbag, created on first FCurve
+
+    def _new_fc(data_path, index, group):
+        if hasattr(blended, "fcurves"):  # Blender < 5.0
+            return blended.fcurves.new(data_path=data_path, index=index, action_group=group)
+        # Blender 5.x: fcurve_ensure_for_datablock() refuses unless the action is
+        # already assigned to the armature, so build slot/layer/channelbag directly.
+        if not _bag:
+            slot  = blended.slots.new(id_type='OBJECT', name=armature.name)
+            strip = blended.layers.new("Layer").strips.new(type='KEYFRAME')
+            _bag.append(strip.channelbag(slot, ensure=True))
+        bag = _bag[0]
+        fc = bag.fcurves.new(data_path, index=index)
+        if group:
+            fc.group = bag.groups.get(group) or bag.groups.new(group)
+        return fc
+
     def _copy_fc(src_action, want_lower: bool):
-        for fc in src_action.fcurves:
+        for fc in _action_fcurves(src_action):
             bone = _fcurve_bone_name(fc.data_path)
             if bone is None:
                 # Non-bone channel (root transform etc.) — copy from lower_action
@@ -173,22 +212,81 @@ def _build_blended_action(armature, upper_action, lower_action, blended_name: st
                 if want_lower != in_lower:
                     continue
             grp_name = fc.group.name if fc.group else ""
-            try:
-                new_fc = blended.fcurves.new(
-                    data_path=fc.data_path,
-                    index=fc.array_index,
-                    action_group=grp_name,
-                )
-            except RuntimeError:
+            key = (fc.data_path, fc.array_index)
+            if key in added:
                 continue  # already added by the other pass — skip
+            try:
+                new_fc = _new_fc(fc.data_path, fc.array_index, grp_name)
+            except RuntimeError as e:
+                print(f"  ⚠️  {{blended_name}}: could not copy {{fc.data_path}}[{{fc.array_index}}]: {{e}}")
+                continue
+            added.add(key)
+            k = lower_loc_scale if (want_lower and fc.data_path.endswith(".location")) else 1.0
             for kp in fc.keyframe_points:
-                new_kp = new_fc.keyframe_points.insert(kp.co[0], kp.co[1], options={{'FAST'}})
+                new_kp = new_fc.keyframe_points.insert(kp.co[0], kp.co[1] * k, options={{'FAST'}})
                 new_kp.interpolation = kp.interpolation
+            if not want_lower:
+                new_fc.modifiers.new(type='CYCLES')
             new_fc.update()
 
     _copy_fc(lower_action, want_lower=True)   # lower body from lower_action (sitting)
     _copy_fc(upper_action, want_lower=False)  # upper body from upper_action (idle/punch)
     return blended
+
+
+# Packs whose actions a lower_body_lock can borrow when no character in the
+# scene carries them (e.g. an Ultimate Modular character sitting via Man_Sitting).
+_DONOR_GLB = {{
+    "Man_":    "assets/Animated Men Pack-glb/Man.glb",
+    "Female_": "assets/Animated Women Pack-glb/Woman.glb",
+}}
+
+
+def _hips_len(armature_data):
+    """Rest-pose hip height in the rig's own units (None if the rig has no hips)."""
+    bone = armature_data.bones.get("Hips") or next(
+        (b for b in armature_data.bones if "hip" in b.name.lower()), None)
+    return bone.head_local.length if bone else None
+
+
+def _resolve_lower_action(name):
+    """
+    Find a lower_body_lock action by name, importing it from its Animated-pack
+    GLB if no character in the scene carries it.
+    Returns (action, rest hip height of the rig it was authored on, or None).
+    """
+    for act in bpy.data.actions:
+        if act.name.split("|")[-1].split(".")[0] != name:
+            continue
+        for o in bpy.data.objects:
+            if o.type == "ARMATURE" and o.animation_data and any(
+                    s.action == act for t in o.animation_data.nla_tracks for s in t.strips):
+                return act, _hips_len(o.data)
+        return act, act.get("rig_hips_len")
+
+    prefix = next((p for p in _DONOR_GLB if name.startswith(p)), None)
+    path = os.path.join(asset_base_path, _DONOR_GLB[prefix]) if prefix else None
+    if not path or not os.path.exists(path):
+        return None, None
+    before_objs, before_acts = set(bpy.data.objects), set(bpy.data.actions)
+    bpy.ops.import_scene.gltf(filepath=path)
+    new_objs = [o for o in bpy.data.objects if o not in before_objs]
+    donor = next((o for o in new_objs if o.type == "ARMATURE"), None)
+    hips = _hips_len(donor.data) if donor else None
+    found = None
+    for act in [a for a in bpy.data.actions if a not in before_acts]:
+        if found is None and act.name.split("|")[-1].split(".")[0] == name:
+            found = act
+        else:
+            bpy.data.actions.remove(act)
+    for o in new_objs:
+        bpy.data.objects.remove(o, do_unlink=True)
+    if found:
+        found.use_fake_user = True
+        if hips:
+            found["rig_hips_len"] = hips
+        print(f"  📥 Borrowed {{name}} from {{_DONOR_GLB[prefix]}}")
+    return found, hips
 # ────────────────────────────────────────────────────────────────────────────
 
 # Scene configuration
@@ -207,7 +305,7 @@ print(f"Render Video: {{render_video}}")
 # Set scene properties
 scene = bpy.context.scene
 scene.frame_start = 1
-scene.frame_end = duration_seconds * frame_rate
+scene.frame_end = int(round(duration_seconds * frame_rate))
 scene.frame_set(1)
 
 # Asset base path
@@ -274,14 +372,14 @@ if os.path.exists(asset_path):
             {sanitized_name}_armature.location = {end_pos}
             {sanitized_name}_armature.keyframe_insert(data_path="location", frame=scene.frame_end)
 
-            for fcurve in char_action.fcurves:
+            for fcurve in _action_fcurves(char_action):
                 if fcurve.data_path == "location":
                     for kp in fcurve.keyframe_points:
                         kp.interpolation = '{interpolation}'
 
             action_length = char_action.frame_range[1] - char_action.frame_range[0]
             looped_curves = 0
-            for fcurve in char_action.fcurves:
+            for fcurve in _action_fcurves(char_action):
                 if fcurve.data_path.startswith('pose.bones'):
                     if not fcurve.modifiers:
                         mod = fcurve.modifiers.new(type='CYCLES')
@@ -412,7 +510,7 @@ else:
             lines.append(f'        {sanitized_name}_armature.keyframe_insert(data_path="rotation_euler", frame={frame})')
 
         # Set interpolation: BEZIER on rotation curves at turning frames, LINEAR elsewhere
-        lines.append(f'        for _fc in _mov_action.fcurves:')
+        lines.append(f'        for _fc in _action_fcurves(_mov_action):')
         lines.append(f'            for _kp in _fc.keyframe_points:')
         lines.append(f'                _f = int(_kp.co[0])')
         lines.append(f'                if _fc.data_path == "rotation_euler" and _f in {sorted(rot_change_frames)}:')
@@ -444,15 +542,14 @@ else:
 
             if lbl:
                 # Find lower-body lock action and build blended action at runtime
-                lines.append(f'        _seg{i}_lower = None')
-                lines.append(f'        for _a in bpy.data.actions:')
-                lines.append(f'            if _a.name.split("|")[-1].split(".")[0] == "{lbl}":')
-                lines.append(f'                _seg{i}_lower = _a')
-                lines.append(f'                break')
+                lines.append(f'        _seg{i}_lower, _seg{i}_src_hips = _resolve_lower_action("{lbl}")')
+                lines.append(f'        _seg{i}_dst_hips = _hips_len({sanitized_name}_armature.data)')
+                lines.append(f'        _seg{i}_loc_scale = (_seg{i}_dst_hips / _seg{i}_src_hips) if (_seg{i}_src_hips and _seg{i}_dst_hips) else 1.0')
                 blended_name = f"{char_name}_blended_{i}_{af}_over_{lbl}"
                 lines.append(f'        if _seg{i}_upper and _seg{i}_lower:')
                 lines.append(f'            _seg{i}_action = _build_blended_action(')
-                lines.append(f'                {sanitized_name}_armature, _seg{i}_upper, _seg{i}_lower, "{blended_name}")')
+                lines.append(f'                {sanitized_name}_armature, _seg{i}_upper, _seg{i}_lower, "{blended_name}",')
+                lines.append(f'                lower_loc_scale=_seg{i}_loc_scale)')
                 lines.append(f'            print(f"  🔀 Blended action: upper={af} + lower={lbl}")')
                 lines.append(f'        elif _seg{i}_upper:')
                 lines.append(f'            _seg{i}_action = _seg{i}_upper')
@@ -466,12 +563,26 @@ else:
             lines.append(f'            _track{i} = _nla_tracks.new()')
             lines.append(f'            _track{i}.name = "{af}"')
             lines.append(f'            _strip{i} = _track{i}.strips.new(_seg{i}_action.name, {sf}, _seg{i}_action)')
+            # *_Sitting clips open with a sit-down from standing. When the character is
+            # already seated (scene start, or previous segment also seated), start from
+            # the settled pose instead of standing up and sitting down again.
+            already_seated = lbl and (i == 0 or segments[i - 1]['lower_body_lock'])
+            if already_seated and 'Sitting' in lbl:
+                lines.append(f'            _strip{i}.action_frame_start += {SIT_SETTLE_FRAMES}')
             lines.append(f'            _strip{i}.frame_start   = {sf}')
             lines.append(f'            _strip{i}.frame_end     = {ef}')
+            # Cross-fade into the next segment instead of snapping: this strip runs on for
+            # the next strip's blend-in, and the next strip fades in on top of it. Strips do
+            # not hold past that, so channels one action keys and the next doesn't (e.g.
+            # Walk's feet under Idle) don't leak into later segments.
+            _blend = lambda a, b: min(NLA_BLEND_FRAMES, max(0, (b - a) // 2))
+            ext = _blend(segments[i + 1]['start_frame'], segments[i + 1]['end_frame']) if i + 1 < len(segments) else 0
             lines.append(f'            _strip{i}.extrapolation = "NOTHING"')
+            if i > 0:
+                lines.append(f'            _strip{i}.blend_in = {_blend(sf, ef)}')
             lines.append(f'            _act{i}_len = _seg{i}_action.frame_range[1] - _seg{i}_action.frame_range[0]')
             lines.append(f'            if _act{i}_len > 0:')
-            lines.append(f'                _strip{i}.repeat = max(1.0, ({ef} - {sf}) / _act{i}_len)')
+            lines.append(f'                _strip{i}.repeat = max(1.0, ({ef} - {sf} + {ext}) / _act{i}_len)')
             lines.append(f'            print(f"  ✅ {char_name} seg {i+1}: {{{{_seg{i}_action.name}}}} frames {sf}–{ef} (repeat={{{{_strip{i}.repeat:.1f}}}}x)")')
             lines.append(f'        else:')
             lines.append(f'            print("  ⚠️  Action not found: {af}")')
@@ -822,6 +933,7 @@ print("✅ Scene generation complete!")
             result = subprocess.run([
                 self.blender_path,
                 "--background",
+                "--python-exit-code", "1",
                 "--python", script_file
             ], capture_output=True, text=True, timeout=300)
             
@@ -836,7 +948,7 @@ print("✅ Scene generation complete!")
                 return True
             else:
                 print(f"\\n❌ Blender execution failed!")
-                print(f"Error: {result.stderr}")
+                print(f"Error: {result.stderr[-1500:]}")
                 return False
                 
         except subprocess.TimeoutExpired:

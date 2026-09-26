@@ -82,7 +82,15 @@ def _safe_name(scene_name: str) -> str:
 # Phase 1
 # ---------------------------------------------------------------------------
 
-def run_phase1(screenplay: str, output_dir: Path, output_name: str = None, backend: str = "auto", model: str = None) -> tuple[str, str]:
+def _read_notes(text: str | None, path: str | None) -> str | None:
+    """Director's notes from --direction/--shotlist text or their *-file variants."""
+    if path:
+        return Path(path).read_text()
+    return text
+
+
+def run_phase1(screenplay: str, output_dir: Path, output_name: str = None, backend: str = "auto", model: str = None,
+               direction: str = None) -> tuple[str, str]:
     """
     Returns (json_path, blend_path).
     """
@@ -94,7 +102,7 @@ def run_phase1(screenplay: str, output_dir: Path, output_name: str = None, backe
     from screenplay_to_scene import ScreenplayToScene
 
     generator = ScreenplayToScene(backend=backend, model=model)
-    data      = generator.generate_json(screenplay)
+    data      = generator.generate_json(screenplay, direction)
     if not data:
         print("❌ Phase 1: JSON generation failed.")
         sys.exit(1)
@@ -107,6 +115,10 @@ def run_phase1(screenplay: str, output_dir: Path, output_name: str = None, backe
 
     json_path  = str(output_dir / f"{output_name}.json")
     blend_path = str(output_dir / f"{output_name}.blend")
+
+    # Asset paths in the JSON are relative to the repo; the generator resolves them
+    # relative to the JSON's folder unless told otherwise, and the JSON lives in output/.
+    data.setdefault("settings", {})["asset_base_path"] = str(Path(__file__).parent.absolute())
 
     with open(json_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -140,6 +152,7 @@ def run_phase2(
     backend:       str = "auto",
     model:         str = None,
     shots_json_in: str = None,
+    shotlist:      str = None,
 ) -> str:
     """
     Returns cameras_blend_path.
@@ -170,6 +183,7 @@ def run_phase2(
         blend_in      = blend_path,
         blend_out     = cameras_blend,
         shots_json_in = shots_json_in,
+        direction     = shotlist,
     )
     if not ok:
         print("❌ Phase 2: Camera setup failed.")
@@ -207,9 +221,15 @@ Examples:
     parser.add_argument("--backend", "-B",  default="auto",       help="LLM backend: groq | anthropic | gemini | openai (default: auto-detect from API keys)")
     parser.add_argument("--model",          default=None,         help="Override model name for chosen backend")
     parser.add_argument("--cameras-json",                         help="Skip LLM — use a pre-written camera shots JSON for Phase 2")
+    parser.add_argument("--direction",                            help="Phase 1 director's notes: characters, blocking and beat timings, "
+                                                                       "e.g. \"A and B talk for 3 s, then A turns away for 2 s, then B walks past A\"")
+    parser.add_argument("--direction-file",                       help="Phase 1 director's notes from a text file")
+    parser.add_argument("--shotlist",                             help="Phase 2 shot list in plain words, e.g. \"wide until he arrives, then CU on him, then CU on her\"")
+    parser.add_argument("--shotlist-file",                        help="Phase 2 shot list from a text file")
     args = parser.parse_args()
 
-    output_dir  = Path(__file__).parent
+    output_dir  = Path(__file__).parent / "output"
+    output_dir.mkdir(exist_ok=True)
     output_name = args.output
 
     print("=" * 60)
@@ -256,14 +276,16 @@ Examples:
             output_name = Path(args.blend).stem
         run_phase2(screenplay, args.json, args.blend, output_dir, output_name,
                    backend=args.backend, model=args.model,
-                   shots_json_in=args.cameras_json)
+                   shots_json_in=args.cameras_json,
+                   shotlist=_read_notes(args.shotlist, args.shotlist_file))
         return
 
     # --- Phase 1 (screenplay required) ---
     screenplay = _resolve_screenplay(args, required=True)
     print(f"Screenplay: {len(screenplay)} characters")
     json_path, blend_path = run_phase1(screenplay, output_dir, output_name,
-                                       backend=args.backend, model=args.model)
+                                       backend=args.backend, model=args.model,
+                                       direction=_read_notes(args.direction, args.direction_file))
     if output_name is None:
         output_name = Path(blend_path).stem
 
@@ -273,7 +295,8 @@ Examples:
 
     # --- Phase 2 ---
     cameras_blend = run_phase2(screenplay, json_path, blend_path, output_dir, output_name,
-                               backend=args.backend, model=args.model)
+                               backend=args.backend, model=args.model,
+                               shotlist=_read_notes(args.shotlist, args.shotlist_file))
 
     print("\n" + "=" * 60)
     print("✅ PIPELINE COMPLETE")

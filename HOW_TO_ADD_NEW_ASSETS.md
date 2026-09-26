@@ -1,6 +1,15 @@
 # How to Add New Assets
 
-The system reads all available asset information directly from `README.md` at runtime. When you add new GLB files, update the README and the LLM will automatically know about them — no code changes needed.
+> **Important:** the pipeline's Phase 1 LLM does **not** read `README.md`. It only sees the asset
+> list in `ASSET_REFERENCE` at the top of `screenplay_to_scene.py`. When you add assets, update
+> **that list** (so the pipeline can use them) **and** the README (so people can find them).
+> Only the older helper modules `screenplay_parser.py` and `location_environment_generator.py`
+> parse the README, and `pipeline.py` doesn't use them.
+
+When adding a character, give the LLM what it needs to pick it: the file name, pack,
+`armature_filter`, scale, the exact animation names, and when to use it (e.g. "Witch.glb —
+witchcraft, magic, fantasy"). For Ultimate Modular characters, add the file to the default or
+costume list in `ASSET_REFERENCE`.
 
 ## Steps
 
@@ -43,7 +52,8 @@ If your pack is best suited for a particular location type, add a note to the re
 python3 pipeline.py "INT. MY SCENE - DAY\n\nCharacter does something with Item1."
 ```
 
-The LLM will now see `My New Pack-glb/Item1.glb` in its available asset list and can select it for appropriate scenes.
+Then add the same pack, files and scale to `ASSET_REFERENCE` in `screenplay_to_scene.py`.
+Only after that will the LLM see `My New Pack-glb/Item1.glb` and select it for appropriate scenes.
 
 ---
 
@@ -51,12 +61,9 @@ The LLM will now see `My New Pack-glb/Item1.glb` in its available asset list and
 
 | Component | Source | Auto-updates? |
 |-----------|--------|--------------|
-| Asset pack names | README.md folder structure | ✅ Yes |
-| GLB file names | README.md folder structure | ✅ Yes |
-| Full asset paths | Combined from above | ✅ Yes |
-| Scaling factors | README.md scaling table | ✅ Yes |
-| Shown to LLM | Parsed from README at runtime | ✅ Yes |
-| Validated by post-processor | Checked against README | ✅ Yes |
+| What the Phase 1 LLM sees (packs, files, scales, animations) | `ASSET_REFERENCE` in `screenplay_to_scene.py` | ❌ Update by hand |
+| What people see | README.md | ❌ Update by hand |
+| Asset paths exist on disk | Checked by the post-processor | ✅ Warns if missing |
 | Location design guidelines | Hardcoded in prompt | ❌ By design |
 
 ---

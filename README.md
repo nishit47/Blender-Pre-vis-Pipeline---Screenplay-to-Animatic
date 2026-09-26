@@ -36,13 +36,15 @@ Phase 2 ── Blender scene
 
 ### 1. Install Blender
 
-Download and install **Blender 4.x** from [blender.org](https://www.blender.org/download/).  
+Download and install **Blender 4.4+ or 5.x** (tested on 5.2) from [blender.org](https://www.blender.org/download/).  
 The pipeline calls Blender in background mode — make sure the `blender` command is on your PATH, or that it lives at `/Applications/Blender.app/Contents/MacOS/Blender` (macOS default).
 
 ### 2. Install Python dependencies
 
 ```bash
-pip install groq anthropic google-generativeai openai pypdf
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ### 3. Set an LLM API key
@@ -120,20 +122,23 @@ AMANDA: Buy me a drink, cowboy?
 Amanda slowly reveals a pistol."
 ```
 
-This produces:
+This runs both phases and writes everything to `output/`:
 - `int__bar___night.json` — editable scene configuration
 - `int__bar___night.blend` — Phase 1 Blender scene
+- `int__bar___night_cameras.blend` — Phase 2 scene with cameras
+
+Add `--scene-only` to stop after Phase 1 so you can adjust the scene before adding cameras.
 
 ### Review and adjust in Blender
 
-Open `int__bar___night.blend`. Reposition characters, fix scales, adjust rotations. Save the file.
+Open `output/int__bar___night.blend`. Reposition characters, fix scales, adjust rotations. Save the file.
 
 ### Add cameras (Phase 2)
 
 ```bash
 python3 pipeline.py --cameras-only \
-  --blend int__bar___night.blend \
-  --json int__bar___night.json
+  --blend output/int__bar___night.blend \
+  --json output/int__bar___night.json
 ```
 
 This produces `int__bar___night_cameras.blend` — fully camera-ready with timeline markers.
@@ -145,15 +150,109 @@ This produces `int__bar___night_cameras.blend` — fully camera-ready with timel
 python3 pipeline.py --backend anthropic "INT. KITCHEN - DAY ..."
 
 # Read screenplay from a file
-python3 pipeline.py --input my_scene.pdf
+python3 pipeline.py --file my_scene.pdf
+
+# Tell Phase 1 the blocking and timing you want (see "Recommended Workflow" below)
+python3 pipeline.py --file my_scene.txt --scene-only \
+  --direction "A and B talk for 3 s, then A walks to B, they talk for 2 s,
+  B turns to face A, 3 s of talk, then B walks past A and A stays put."
+
+# Tell Phase 2 the shots you want, in plain words
+python3 pipeline.py --cameras-only --blend scene.blend --json scene.json \
+  --shotlist "A wide until A arrives, then a CU on A, then a CU on B, then follow B
+  from behind as B walks past A, and settle on A until the end."
 
 # Rebuild .blend from a manually edited JSON (no LLM re-call)
-python3 pipeline.py --regen int__bar___night.json
+python3 pipeline.py --regen --json output/int__bar___night.json
 
 # Use your own hand-crafted camera shots file
 python3 pipeline.py --cameras-only --blend scene.blend --json scene.json \
   --cameras-json my_cameras.json
 ```
+
+---
+
+## 🎬 Recommended Workflow & Tips (read this first)
+
+The pipeline is built to give you a usable base quickly; you then direct it and make targeted
+fixes (by hand or through BlenderMCP). These habits avoid the most common mistakes.
+
+### 1. Characters: Ultimate Modular by default
+
+The pipeline picks characters from the **Ultimate Modular** packs by default, because they
+have `Interact` (a talking / explaining gesture) and `Wave`, which the Animated packs don't.
+They can also sit (see [Lower-body lock](#-animation-quick-reference)).
+
+| Who | Default models (priority order) |
+|-----|---------------------------------|
+| Women | `Animated Woman.glb`, `Animated Woman-nIItLV9nxS.glb` |
+| Men | `Casual Character.glb`, `Hoodie Character.glb`, `Beach Character.glb` |
+
+Costumes are picked from context instead: `Business Man` / `Suit` for an office, `Witch` for
+witchcraft, `Swat` for police, `Soldier` for military, `King` / `Medieval` for fantasy,
+`Astronaut` / `Sci Fi Character` for space, `Farmer`, `Worker`, `Adventurer`, `Punk`.
+Each character in a scene gets a different model. If you want specific ones, say so in
+`--direction` (e.g. "A is the Hoodie Character").
+
+### 2. Talking scenes: characters take turns
+
+In dialogue the pipeline alternates short `Interact` turns (0.5–0.75 s) between speakers,
+following the line order, while the listener stays `Idle`. Both characters gesturing at the
+same time looks like they are shouting over each other, so ask for this explicitly if you
+edit the JSON by hand. Seated characters do the same with `lower_body_lock` on every turn.
+
+### 3. Describe the blocking and timing before adjusting by hand
+
+Before touching the scene manually, describe **who does what, when, and for how long** —
+through `--direction`, or by telling your MCP agent. For example:
+
+> A and B talk for 3 seconds, then A turns away from B for 2 seconds and turns back to B.
+> B then walks past A in anger (3 seconds).
+
+This gives the pipeline a clear timeline to build from, and it gives Phase 2 named beats
+to cut on. You can then refer to them when directing cameras ("cut to B as he starts walking").
+The most useful beats to spell out are **facing** (who looks at whom, who turns away),
+**walking** (from where to where, and past whom), and **the order of events**; the pipeline
+fills the talking in between.
+
+### 4. Phase 2: describe your shot list, then adjust
+
+Instead of accepting the automatic shot plan, describe the shots you want with `--shotlist`
+(or to your MCP agent), referencing the beats from step 3:
+
+> A wide as he walks in; a close-up of him once he's there; then her; then follow her from
+> behind as she walks past him, and settle on him until the end.
+
+The camera code handles placement, framing on the characters' heads, following moving
+characters, and keeping cameras out of walls and furniture. Then make the final manual
+tweaks. This is much faster than building cameras by hand. Shot options the camera code
+understands, beyond the basic movements: `movement_end_second` (a move finishes early and
+holds), `pan_to` (the camera turns from one character to another), and `height_offset`
+(raise the camera to see over counters or tables).
+
+### 5. Manual adjustments: move the RootNode, not the character
+
+Each imported character is parented to an unanimated Empty (`RootNode`, `RootNode.001`, ...).
+Characters' location and rotation are keyframed, so **moving a character directly reverts as
+soon as the timeline plays**. Move or rotate its `RootNode` instead — the whole animation moves
+with it. To rotate in place, first set the pivot to the character (Shift+S → Cursor to
+Selected, Pivot Point → 3D Cursor).
+
+Change **timing** through the JSON and `--regen`, not by dragging keyframes: Phase 2 plans its
+cuts from the JSON's timeline. Do timing changes first, then placement, since `--regen`
+rebuilds the scene.
+
+### 6. Adding characters and locations
+
+If you need a specific character or set, import it into `assets/`, then update **both** this
+README and the asset list the Phase 1 LLM actually reads (`ASSET_REFERENCE` at the top of
+`screenplay_to_scene.py`) — see `HOW_TO_ADD_NEW_ASSETS.md`.
+
+To choose what to use or add, browse the source libraries:
+[Quaternius on Poly Pizza](https://poly.pizza/u/Quaternius) (characters and animation packs;
+also [quaternius.com](https://quaternius.com)) and [Kenney](https://kenney.nl/assets) (sets and
+props). Looking there first lets you name specific characters for a scene, and the exact
+animations you want, when you direct it.
 
 ---
 
@@ -185,33 +284,40 @@ python3 pipeline.py --cameras-only --blend scene.blend --json scene.json \
 
 ## 🎭 Character Assets & Animations
 
-### Animated Men Pack (primary casual characters)
+### Ultimate Modular Women Pack (default for women)
+
+- **Default**: `Animated Woman.glb`, `Animated Woman-nIItLV9nxS.glb`
+- **Costumes**: `Suit`, `Witch`, `Soldier`, `Medieval`, `Adventurer`, `Worker`, `Punk`, `Sci Fi Character`
+- **Path**: `assets/Ultimate Modular Women Pack-glb/<name>.glb`
+- **Armature**: `CharacterArmature` · **Scale**: `2.5x` · **Grip bones**: `Wrist.R` / `Wrist.L`
+- **Animations**: same as the Men pack below
+
+### Ultimate Modular Men Pack (default for men)
+
+- **Default** (priority order): `Casual Character.glb`, `Hoodie Character.glb`, `Beach Character.glb`
+- **Costumes**: `Business Man`, `Swat`, `Astronaut`, `King`, `Farmer`, `Worker`, `Adventurer`, `Punk`
+- **Path**: `assets/Ultimate Modular Men Pack-glb/<name>.glb`
+- **Armature**: `CharacterArmature` · **Scale**: `2.5x` · **Grip bones**: `Wrist.R` / `Wrist.L`
+- **Animations** (all 21 Ultimate Modular characters share these 24): `Idle`, `Idle_Neutral`, `Walk`,
+  `Run`, `Run_Back`, `Run_Left`, `Run_Right`, `Death`, `Roll`, `Punch_Left`, `Punch_Right`,
+  `Kick_Left`, `Kick_Right`, `Sword_Slash`, `Idle_Sword`, `Gun_Shoot`, `Idle_Gun`,
+  `Idle_Gun_Pointing`, `Idle_Gun_Shoot`, `Run_Shoot`, `HitRecieve`, `HitRecieve_2`, `Wave`, `Interact`
+
+### Animated Men Pack (fallback)
 
 - **Path**: `assets/Animated Men Pack-glb/Man.glb` (or Man in Suit, Man in Long Sleeves)
-- **Armature**: `HumanArmature`
-- **Scale**: `1x`
+- **Armature**: `HumanArmature` · **Scale**: `1x` · **Grip bones**: `Palm.R` / `Palm.L`
 - **Animations**: `Man_Idle`, `Man_Walk`, `Man_Run`, `Man_Death`, `Man_Punch`, `Man_Jump`, `Man_Clapping`, `Man_Sitting`, `Man_SwordSlash`
 
-### Animated Women Pack (primary casual characters)
+### Animated Women Pack (fallback)
 
-- **Path**: `assets/Animated Women Pack-glb/Woman.glb` (or Woman Casual, Woman in Dress)
-- **Armature**: `HumanArmature`
-- **Scale**: `1x`
+- **Path**: `assets/Animated Women Pack-glb/Woman.glb` (or Woman Casual, Woman in Dress, Woman in Tank Top)
+- **Armature**: `HumanArmature` · **Scale**: `1x` · **Grip bones**: `Palm.R` / `Palm.L`
 - **Animations**: `Female_Idle`, `Female_Walk`, `Female_Run`, `Female_Death`, `Female_Punch`, `Female_Jump`, `Female_Clapping`, `Female_Sitting`, `Female_SwordSlash`
 
-### Ultimate Modular Men Pack (costume/profession characters)
-
-- **Path**: `assets/Ultimate Modular Men Pack-glb/Business Man.glb` (etc.)
-- **Armature**: `CharacterArmature`
-- **Scale**: `2.5x`
-- **Animations**: `Idle`, `Walk`, `Run`, `Death`, `Punch_Left`, `Punch_Right`, `Kick_Left`, `Kick_Right`, `Sword_Slash`, `Gun_Shoot`, `Idle_Gun`, `Run_Shoot`, `Wave`, `Interact`, `Roll`
-
-### Ultimate Modular Women Pack (costume/profession characters)
-
-- **Path**: `assets/Ultimate Modular Women Pack-glb/Soldier.glb` (etc.)
-- **Armature**: `CharacterArmature`
-- **Scale**: `2.5x`
-- **Animations**: Same as Ultimate Modular Men Pack above
+Use the Animated packs only when a scene needs one of their unique clips (Clapping, Jump).
+Animation names differ between the packs; if the LLM mixes them up, post-processing maps
+them to the right pack (e.g. `Man_Walk` → `Walk` on an Ultimate Modular character).
 
 ### Animals (Wolf, Fox, Shiba Inu, Horse, Cow, etc.)
 
@@ -221,18 +327,23 @@ python3 pipeline.py --cameras-only --blend scene.blend --json scene.json \
 
 ## 🎯 Animation Quick Reference
 
-| Action       | Animated Pack (HumanArmature) | Ultimate Modular (CharacterArmature) | Animals  |
-|--------------|-------------------------------|--------------------------------------|----------|
-| Stand still  | Man_Idle / Female_Idle        | Idle                                 | Idle     |
-| Walk         | Man_Walk / Female_Walk        | Walk                                 | Walk     |
-| Run          | Man_Run / Female_Run          | Run                                  | Gallop   |
-| Sitting      | Man_Sitting / Female_Sitting  | *(none)*                             | *(none)* |
-| Punch/Fight  | Man_Punch / Female_Punch      | Punch_Left, Kick_Right               | Attack   |
-| Wave/Greet   | Man_Clapping / Female_Clapping| Wave                                 | *(none)* |
-| Die          | Man_Death / Female_Death      | Death                                | Death    |
-| Shoot (stand)| *(none)*                      | Gun_Shoot, Idle_Gun                  | *(none)* |
+| Action       | Ultimate Modular (CharacterArmature) — default | Animated Pack (HumanArmature) | Animals  |
+|--------------|---------------------------------------|-------------------------------|----------|
+| Stand still  | Idle                                  | Man_Idle / Female_Idle        | Idle     |
+| **Talk**     | **Interact** (0.5–0.75 s turns, alternating) | *(none — Idle)*        | *(none)* |
+| Walk         | Walk                                  | Man_Walk / Female_Walk        | Walk     |
+| Run          | Run                                   | Man_Run / Female_Run          | Gallop   |
+| Sitting      | lower_body_lock `Man_Sitting` / `Female_Sitting` | Man_Sitting / Female_Sitting (as lower_body_lock) | *(none)* |
+| Punch/Fight  | Punch_Left, Kick_Right                | Man_Punch / Female_Punch      | Attack   |
+| Wave/Greet   | Wave                                  | Man_Clapping / Female_Clapping| *(none)* |
+| Hit / flinch | HitRecieve                            | *(none)*                      | *(none)* |
+| Die          | Death                                 | Man_Death / Female_Death      | Death    |
+| Shoot (stand)| Gun_Shoot, Idle_Gun                   | *(none)*                      | *(none)* |
 
-> **Lower-body lock**: To have a character sit while their upper body performs another animation (e.g., shooting while seated), use `lower_body_lock` in the animation segment — see JSON format below.
+> **Lower-body lock**: To have a character sit while their upper body performs another animation
+> (talking, idling, shooting), set `lower_body_lock` to `Man_Sitting` / `Female_Sitting` on each
+> seated segment. This works for **both** packs: for Ultimate Modular characters the pipeline
+> imports the sitting legs from the Animated pack and fits them to the rig automatically.
 
 ## ⚠️ CRITICAL: Character Movement Rules
 
@@ -1469,27 +1580,35 @@ When using `--cameras-json`, the file format is:
 
 ## 🛠️ System Requirements
 
-- **Blender 4.x** installed at `/Applications/Blender.app/Contents/MacOS/Blender` (macOS) or `blender` on PATH
+- **Blender 4.4+ or 5.x** installed at `/Applications/Blender.app/Contents/MacOS/Blender` (macOS) or `blender` on PATH
 - **Python 3.9+**
 - At least one LLM API key (see Prerequisites above)
 - Python packages: `groq`, `anthropic`, `google-generativeai`, `openai`, `pypdf`
 
 ```bash
-pip install groq anthropic google-generativeai openai pypdf
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ### Supported LLM Backends
 
 | Backend | Env Var | Default Model | Cost |
 |---------|---------|---------------|------|
-| Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Free tier available |
+| Groq | `GROQ_API_KEY` | `openai/gpt-oss-120b` | Free tier available |
 | Anthropic | `ANTHROPIC_API_KEY` | `claude-opus-4-5` | Paid |
 | Gemini | `GEMINI_API_KEY` | `gemini-2.0-flash` | Free tier available |
 | OpenAI | `OPENAI_API_KEY` | `gpt-4o` | Paid |
 
 Auto-detection order when `--backend auto` (default): Groq → Anthropic → Gemini → OpenAI
 
-Override model: `export GROQ_MODEL=llama-3.1-8b-instant` (or `ANTHROPIC_MODEL`, `GEMINI_MODEL`, `OPENAI_MODEL`).
+Override model: `export GROQ_MODEL=openai/gpt-oss-20b` (or `ANTHROPIC_MODEL`, `GEMINI_MODEL`, `OPENAI_MODEL`).
+
+**Groq free tier:** requests are capped at 8,000 tokens per minute, counting the prompt *plus*
+the response budget, so the Phase 1 prompt is kept compact (~3.3k tokens) and gpt-oss models
+run with `reasoning_effort=low` (override with `export GROQ_REASONING_EFFORT=medium`). At the
+default effort gpt-oss can spend its whole output budget reasoning and return truncated JSON.
+Run scripts one at a time; the client waits out rate limits automatically.
 
 ## 🔍 Troubleshooting
 

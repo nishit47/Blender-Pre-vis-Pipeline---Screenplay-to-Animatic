@@ -2,7 +2,7 @@
 llm_client.py — Pluggable LLM backend for the pre-vis pipeline.
 
 Supported backends:
-  groq      (free)   GROQ_API_KEY       → llama-3.3-70b-versatile
+  groq      (free)   GROQ_API_KEY       → openai/gpt-oss-120b
   anthropic (paid)   ANTHROPIC_API_KEY  → claude-opus-4-5
   gemini    (paid)   GEMINI_API_KEY     → gemini-2.0-flash
   openai    (paid)   OPENAI_API_KEY     → gpt-4o
@@ -15,7 +15,7 @@ Selection (first match wins):
 Override the model for any backend:
   export ANTHROPIC_MODEL=claude-opus-4-5
   export GEMINI_MODEL=gemini-2.5-pro
-  export GROQ_MODEL=llama-3.3-70b-versatile
+  export GROQ_MODEL=openai/gpt-oss-120b
   export OPENAI_MODEL=gpt-4o
 
 Installation (only install what you need):
@@ -33,8 +33,8 @@ import sys
 BACKENDS = {
     "groq": {
         "env":           "GROQ_API_KEY",
-        "default_model": "llama-3.3-70b-versatile",
-        "label":         "Groq (free) — llama-3.3-70b",
+        "default_model": "openai/gpt-oss-120b",
+        "label":         "Groq (free) — gpt-oss-120b",
         "model_env":     "GROQ_MODEL",
         "install":       "pip install requests",
     },
@@ -128,23 +128,38 @@ class LLMClient:
     # ── Groq ──────────────────────────────────────────────────────────────────
 
     def _call_groq(self, prompt: str, max_tokens: int) -> str:
+        import time
         import requests
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "model":       self.model,
-                "messages":    [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
-                "max_tokens":  max_tokens,
-            },
-            timeout=120,
-        )
-        if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"]
+        # Free tier has a low tokens-per-minute cap, so Phase 1 + Phase 2 back-to-back
+        # usually trips a 429 — wait out the window Groq asks for, then retry.
+        body = {
+            "model":       self.model,
+            "messages":    [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens":  max_tokens,
+        }
+        # gpt-oss reasoning tokens count against max_tokens; at the default effort they can
+        # use up the whole budget and cut the JSON off. Low effort leaves room for the answer.
+        if "gpt-oss" in self.model:
+            body["reasoning_effort"] = os.environ.get("GROQ_REASONING_EFFORT", "low")
+        for attempt in range(4):
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type":  "application/json",
+                },
+                json=body,
+                timeout=120,
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"]
+            if resp.status_code == 429 and attempt < 3:
+                wait = min(float(resp.headers.get("retry-after", 20)) + 1, 65)
+                print(f"  ⏳ Groq rate limit — waiting {wait:.0f}s...")
+                time.sleep(wait)
+                continue
+            break
         raise RuntimeError(f"Groq error {resp.status_code}: {resp.text[:400]}")
 
     # ── Anthropic (Claude) ────────────────────────────────────────────────────

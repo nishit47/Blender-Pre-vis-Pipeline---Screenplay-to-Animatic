@@ -3,7 +3,7 @@
 Screenplay to Blender Scene — Fully Automated Pipeline
 =======================================================
 
-Reads a screenplay excerpt, uses Groq (llama-3.3-70b) to generate a complete
+Reads a screenplay excerpt, uses an LLM (Groq gpt-oss-120b by default) to generate a complete
 scene JSON, then runs flexible_scene_generator_optimized.py to build the Blender file.
 No manual JSON writing needed.
 
@@ -32,300 +32,124 @@ import requests
 # --------------------------------------------------------------------------- #
 
 ASSET_REFERENCE = """
-=== CHARACTER PACKS & ANIMATIONS ===
+=== CHARACTERS (people: use Ultimate Modular by default) ===
+Ultimate Modular packs have "Interact" (talking gesture) and "Wave", and can sit. Use the
+Animated packs only for their unique clips (Clapping, Jump). Give each character a different model.
 
-Pack: Animated Men Pack-glb        armature_filter: HumanArmature   scale: 1x
-  Files: Man.glb, Man in Suit.glb, Man in Long Sleeves.glb
-  Animations (EXACT names — use ONLY these):
-    Man_Idle, Man_Walk, Man_Run, Man_Death, Man_Punch,
-    Man_Jump, Man_Clapping, Man_Sitting, Man_SwordSlash
-  USAGE GUIDE:
-    Man_Idle      = standing still, talking, waiting, shocked, drawing a weapon (no draw anim)
-    Man_Walk      = walking at normal pace
-    Man_Run       = running / fleeing fast
-    Man_Clapping  = waving hello, waving goodbye, clapping, any greeting gesture
-    Man_Punch     = ONLY for actual physical punches/fighting
-    Man_SwordSlash= ONLY for sword/melee weapon swing
-    Man_Death     = ONLY for dying/collapsing
-    Man_Sitting   = lower body pose for sitting; pair with lower_body_lock (see below)
-    Man_Jump      = ONLY for jumping
+Ultimate Modular Women Pack-glb   armature_filter: CharacterArmature   scale: 2.5
+  DEFAULT: Animated Woman.glb, Animated Woman-nIItLV9nxS.glb
+  By context: Suit (office, business), Witch (witchcraft, magic), Soldier (military),
+  Medieval (historical), Adventurer (explorer), Worker (construction), Punk (street),
+  Sci Fi Character (sci-fi, space)
+Ultimate Modular Men Pack-glb     armature_filter: CharacterArmature   scale: 2.5
+  DEFAULT (in order): Casual Character.glb, Hoodie Character.glb, Beach Character.glb
+  (Beach Character first for beach / summer scenes)
+  By context: Business Man (office), Swat (police), Astronaut (space), King (royalty,
+  fantasy), Farmer (farm), Worker (construction), Adventurer (explorer), Punk (street)
+  Animations (both packs, EXACT names): Idle, Idle_Neutral, Walk, Run, Run_Back, Run_Left,
+  Run_Right, Death, Roll, Punch_Left, Punch_Right, Kick_Left, Kick_Right, Sword_Slash,
+  Idle_Sword, Gun_Shoot, Idle_Gun, Idle_Gun_Pointing, Idle_Gun_Shoot, Run_Shoot,
+  HitRecieve, HitRecieve_2, Wave, Interact
+  Idle = still/listening; Interact = talking; Wave = hello/goodbye/waving off;
+  HitRecieve = flinch; Idle_Gun / Idle_Gun_Pointing / Gun_Shoot = hold / aim / fire.
+  Grip bones: Wrist.R / Wrist.L
 
-  LOWER BODY LOCK:
-    When a character is SEATED and does something with their upper body (talks, shoots,
-    waves, picks something up), use:
-      "action_filter": "<upper_body_anim>",   ← what the upper body plays
-      "lower_body_lock": "Man_Sitting"         ← lower body is frozen in sitting pose
-    The system will merge both actions at runtime, locking the legs in place.
-    Example: seated character shoots → action_filter: "Man_Punch", lower_body_lock: "Man_Sitting"
-    Example: seated character idles  → action_filter: "Man_Idle",  lower_body_lock: "Man_Sitting"
+SITTING (any pack): keep the upper-body clip in action_filter and add
+  "lower_body_lock": "Female_Sitting" (women) or "Man_Sitting" (men) on every seated segment.
+  e.g. seated woman talking: action_filter "Interact", lower_body_lock "Female_Sitting".
 
-Pack: Animated Women Pack-glb      armature_filter: HumanArmature   scale: 1x
-  Files: Woman.glb, Woman Casual.glb, Woman in Dress.glb, Woman in Tank Top.glb
-  Animations (EXACT names — use ONLY these):
-    Female_Idle, Female_Walk, Female_Run, Female_Death, Female_Punch,
-    Female_Jump, Female_Clapping, Female_Sitting, Female_SwordSlash
-  USAGE GUIDE:
-    Female_Idle      = standing still, talking, waiting, shocked, doing chores, etc.
-    Female_Walk      = walking at normal pace
-    Female_Run       = running / fleeing fast
-    Female_Clapping  = waving hello, waving goodbye, clapping, any greeting gesture
-    Female_Punch     = ONLY for actual physical punches/fighting
-    Female_SwordSlash= ONLY for sword/melee weapon swing
-    Female_Death     = ONLY for dying/collapsing
-    Female_Sitting   = lower body pose for sitting; pair with lower_body_lock (see below)
-    Female_Jump      = ONLY for jumping
+TALKING: for each stretch of conversation give EVERY participant ONE "Interact" segment
+  covering the whole stretch (same start/end seconds) and add "speaks_first": true to the
+  first speaker's. The system splits these into alternating 0.75 s turns — do NOT write the
+  turns yourself. A walk, turn or pause ends a stretch; start new Interact segments after it.
+  Silent, sulking or turned-away characters use "Idle".
 
-  LOWER BODY LOCK:
-    When a character is SEATED and does something with their upper body (talks, shoots,
-    waves, picks something up), use:
-      "action_filter": "<upper_body_anim>",     ← what the upper body plays
-      "lower_body_lock": "Female_Sitting"        ← lower body is frozen in sitting pose
-    Example: seated character holds gun → action_filter: "Female_Idle", lower_body_lock: "Female_Sitting"
+Animated Men Pack-glb (fallback)    armature_filter: HumanArmature   scale: 1
+  Man.glb, Man in Suit.glb, Man in Long Sleeves.glb — Man_Idle, Man_Walk, Man_Run,
+  Man_Death, Man_Punch, Man_Jump, Man_Clapping, Man_SwordSlash, (Man_Sitting: lock only).
+Animated Women Pack-glb (fallback)  armature_filter: HumanArmature   scale: 1
+  Woman.glb, Woman Casual.glb, Woman in Dress.glb, Woman in Tank Top.glb — Female_Idle,
+  Female_Walk, Female_Run, Female_Death, Female_Punch, Female_Jump, Female_Clapping,
+  Female_SwordSlash, (Female_Sitting: lock only). Grip bones: Palm.R / Palm.L. No Interact/Wave.
+Animated Animal Pack-glb            armature_filter: AnimalArmature  scale: 1
+  Wolf, Fox, Shiba Inu, Horse, Cow, Dog, Cat — Idle, Walk, Gallop, Death, Eating, Attack,
+  Jump_ToIdle, Attack_Headbutt, Attack_Kick
+⚠️  NEVER invent animation names. Use only the exact names above for that character's pack.
 
-Pack: Ultimate Modular Men Pack-glb    armature_filter: CharacterArmature   scale: 2.5x
-  Files: Business Man.glb, Casual Character.glb, Worker.glb, Adventurer.glb,
-         Hoodie Character.glb, Farmer.glb, Astronaut.glb, King.glb, Punk.glb, Swat.glb
-  Animations (EXACT names — use ONLY these):
-    Idle, Walk, Run, Death, Punch_Left, Punch_Right, Kick_Left, Kick_Right,
-    Sword_Slash, Gun_Shoot, Idle_Gun, Run_Shoot, Roll, Wave, Interact
+=== LOCATIONS (one pre-built environment; count 1, scale on all axes) ===
+  assets/locations/Cozy Kitchen.glb 7.5 | Living Room.glb 5.0 | bedroom.glb 4.0 |
+  Bar scene.glb 1.0 | Beach.glb 0.2 | Gas Station.glb 7.0 | Little Shop.glb 12.0 | Ocean.glb 1.0
+  No match? Use props from: Ultimate House Interior Pack-glb (1.5), Stylized Nature
+  MegaKit.undefined-glb (1), kenney_city-kit-commercial_2.1 (20), Medieval Village Pack-glb (8).
 
-Pack: Ultimate Modular Women Pack-glb  armature_filter: CharacterArmature   scale: 2.5x
-  Files: Adventurer.glb, Worker.glb, Soldier.glb, Suit.glb, Witch.glb,
-         Medieval.glb, Punk.glb, Sci Fi Character.glb
-  Animations (EXACT names — use ONLY these, same as Ultimate Modular Men):
-    Idle, Walk, Run, Death, Punch_Left, Punch_Right, Kick_Left, Kick_Right,
-    Sword_Slash, Gun_Shoot, Idle_Gun, Run_Shoot, Roll, Wave, Interact
-  NOTE: The Ultimate Modular packs DO have "Wave". The Animated (basic) packs do NOT.
+=== PROPS (only if a character explicitly holds something; otherwise omit "props") ===
+  Scale = real size in metres. position_offset ALWAYS [0, 0, 0]. rotation_offset in radians
+  (a forward-pointing gun: [1.5708, 0, 0]).
+  Ultimate Guns Pack-glb: Pistol 0.20, Revolver 0.22, Assault Rifle 0.70, Sniper Rifle 0.90,
+    Shotgun 0.75, Submachine Gun 0.45, Bullpup 0.55, Bayonet 0.30
+  Survival Pack-glb: Axe 0.40, Knife 0.25, Pan 0.30, Phone 0.12, Backpack 0.40,
+    First Aid Kit 0.20, Gas Can 0.25, Compass 0.08, Matchbox 0.06
 
-⚠️  CRITICAL: NEVER invent animation names. Only use the exact names listed above.
-
-Pack: Animated Animal Pack-glb     armature_filter: AnimalArmature   scale: 1x
-  Files: Wolf.glb, Fox.glb, Shiba Inu.glb, Horse.glb, Cow.glb, Dog.glb, Cat.glb
-  Animations: Idle, Walk, Gallop, Death, Eating, Attack, Jump_ToIdle,
-              Attack_Headbutt, Attack_Kick
-
-=== LOCATION ENVIRONMENTS ===
-
-Use ONE of these as asset_path for a complete pre-built environment.
-The scale value is a multiplier applied on top of import scale.
-
-  assets/locations/Cozy Kitchen.glb     scale: 7.5
-  assets/locations/Living Room.glb      scale: 5.0
-  assets/locations/bedroom.glb          scale: 4.0
-  assets/locations/Bar scene.glb        scale: 1.0
-  assets/locations/Beach.glb            scale: 0.2
-  assets/locations/Gas Station.glb      scale: 7.0
-  assets/locations/Little Shop.glb      scale: 12.0
-  assets/locations/Ocean.glb            scale: 1.0
-
-If no matching pre-built scene exists, use individual props from:
-  assets/Ultimate House Interior Pack-glb/   (scale 1.5x each)
-  assets/Stylized Nature MegaKit.undefined-glb/  (scale 1x each)
-  assets/kenney_city-kit-commercial_2.1/    (scale 20x each)
-  assets/Medieval Village Pack-glb/         (scale 8x each)
-
-=== PROP ASSETS & BONE ATTACHMENT ===
-
-Attach props to a character's hand by specifying the character name and their grip bone.
-
-Grip bones (right hand / left hand):
-  Animated Men Pack   → Palm.R  / Palm.L
-  Animated Women Pack → Palm.R  / Palm.L
-  Ultimate Modular    → Wrist.R / Wrist.L
-
-Props live in these packs. Prop scale = real-world size in METRES (the code auto-compensates
-for the armature's internal scale, so just use realistic physical dimensions):
-  assets/Ultimate Guns Pack-glb/
-    Pistol.glb          → scale 0.20   (20 cm pistol)
-    Revolver.glb        → scale 0.22
-    Assault Rifle.glb   → scale 0.70
-    Sniper Rifle.glb    → scale 0.90
-    Shotgun.glb         → scale 0.75
-    Submachine Gun.glb  → scale 0.45
-    Bullpup.glb         → scale 0.55
-    Bayonet.glb         → scale 0.30
-
-  assets/Survival Pack-glb/
-    Axe.glb             → scale 0.40
-    Knife.glb           → scale 0.25
-    Pan.glb             → scale 0.30
-    Phone.glb           → scale 0.12
-    Backpack.glb        → scale 0.40
-    First Aid Kit.glb   → scale 0.20
-    Gas Can.glb         → scale 0.25
-    Compass.glb         → scale 0.08
-    Matchbox.glb        → scale 0.06
-
-Only add a "props" key when a character is explicitly holding something.
-Omit "props" entirely for scenes with no hand-held items.
-
-position_offset: [x, y, z] in bone-local space. ALWAYS use [0, 0, 0] — this places the
-  prop exactly at the bone node. The armature scale is ~100, so any non-zero value
-  creates a large world-space offset. Only change if explicitly told to.
-rotation_offset: [x, y, z] radians to orient the prop in the grip.
-  A gun pointing forward typically needs [1.5708, 0, 0] (90° around X).
-
-=== COORDINATE SYSTEM & MOVEMENT RULES ===
-
-- All characters face the NEGATIVE Y direction (-Y) by default.
-- FORWARD movement: start_position Y > end_position Y  (Y decreases = forward).
-- BACKWARD movement: Y increases — avoid unless intentional.
-- Higher Y = further from camera. Lower Y = closer to camera.
-- start_rotation / end_rotation are Z-axis OFFSETS in radians (do NOT touch X or Y):
-    0.0      = default facing (-Y)
-    3.14159  = 180° turn (now faces +Y)
-    1.5708   = 90° turn left
-   -1.5708   = 90° turn right
-- Characters standing still: start_position == end_position.
-- Keep all characters at Z=0 (floor level).
-- Separate characters by at least 1 unit on X to avoid overlap.
-
-=== TIMING RULES ===
-
-- Use seconds for all timing (start_second, end_second), not frames.
-- Walking across a room: 3–6 seconds.
-- Quick reaction / turn: 0.5–1 second.
-- Wave / greeting gesture: 2–3 seconds.
-- Idle hold during dialogue: as long as needed.
-- duration_seconds = latest end_second across all characters.
-- frame_rate is always 24.
-
-=== SYNCHRONIZATION RULES ===
-
-- Characters must react AFTER the event that triggers them — never before.
-  Example: if RAUL arrives at second 3, ADRIANA must not turn until second 3 or later.
-- To find when a character arrives: look at the end_second of their walk segment.
-- Build a shared event timeline first, then assign each character's segments around it.
-
-=== INTERPERSONAL DISTANCE RULES ===
-
-- Two characters having a conversation: stop 1.5–2.0 units apart on Y (not closer).
-- Passing by / brief interaction: 1.0–1.5 units apart.
-- NEVER place two characters within 1.0 units of each other on Y — they will clip.
-  Example: if ADRIANA is at Y=4, RAUL should stop at Y=6 (2 units away), not Y=5.
-- Separate characters on X by at least 1 unit to avoid side-by-side overlap.
-
-=== ROTATION & FACING RULES ===
-
-All characters start facing -Y (rot_z = 0.0) by default.
-When two characters face each other across Y, one faces -Y (0.0) and the other faces +Y (3.14159).
-
-A character MUST turn when any of these happen in the screenplay:
-  - "turns around", "turns to face", "looks at", "hears X and turns"
-  - A character who was walking toward someone and stops — they are already facing them.
-    A character who was doing something else (e.g. dishes) and becomes aware — they must turn.
-  - After a turn, they STAY at the new rotation for all remaining segments.
-
-A turn MUST be three consecutive segments:
-    1. Idle/wait segment   — holds at old rotation, interpolation CONSTANT
-    2. Turn segment        — 0.5–1s, BEZIER, start_rotation = old, end_rotation = new
-    3. Post-turn segment   — holds at new rotation, interpolation CONSTANT
-
-⚠️  NEVER skip the turn segment. If a character's rotation changes at any point, there
-    MUST be an explicit BEZIER segment showing the rotation changing.
-⚠️  NEVER change rotation silently between segments — if seg[i].end_rotation != seg[i+1].start_rotation
-    without a BEZIER segment between them, that is a bug.
-
-=== ANIMATION SEQUENCE CONTINUITY RULES ===
-
-- animation_sequence segments must be CONTIGUOUS — no gaps, no overlaps.
-  The start_second of each segment must exactly equal the end_second of the previous one.
-- Every character must have a segment covering every second from 0 to duration_seconds.
-  Use Female_Idle / Man_Idle to fill any waiting periods.
-- Rotation must be CONSISTENT across the whole sequence:
-  whatever rot_z a segment ends with, the next segment must START with the same value.
+=== SPACE, TIME & FACING RULES ===
+- Characters face -Y by default. Rotations are Z offsets in radians: 0 = -Y, 3.14159 = +Y,
+  1.5708 = turn left, -1.5708 = turn right. Walking forward = Y decreasing.
+- Keep Z = 0 (floor). Standing still: start_position == end_position.
+- Conversation distance 1.5–2.0 units; passing 1.0–1.5; never closer than 1.0. Separate on X by ≥ 1.
+- Seconds, not frames; frame_rate 24; duration_seconds = latest end_second.
+  Walk across a room 3–6 s; a turn 0.5–1 s; a wave 2–3 s.
+- Reactions come AFTER their trigger (build one shared event timeline first; a walk ends at
+  its end_second).
+- A character who turns / looks at / becomes aware of someone MUST turn with three segments:
+  hold old rotation (CONSTANT) → turn 0.5–1 s (BEZIER) → hold new rotation (CONSTANT).
+  A character walking toward someone already faces them. Never change rotation silently.
+- Segments are CONTIGUOUS from 0 to duration_seconds (no gaps / overlaps; fill with Idle),
+  and each segment starts with the previous one's end_rotation.
 """
 
 JSON_FORMAT = """
 === REQUIRED JSON FORMAT ===
-
 {
-  "scene": {
-    "name": "INT. LOCATION - TIME",
-    "duration_seconds": 12,
-    "frame_rate": 24
-  },
+  "scene": {"name": "INT. LOCATION - TIME", "duration_seconds": 12, "frame_rate": 24},
   "characters": [
     {
       "name": "CHARACTER_NAME",
-      "asset_path": "assets/Pack-glb/Character.glb",
-      "armature_filter": "HumanArmature",
-      "scale": [1, 1, 1],
+      "asset_path": "assets/Ultimate Modular Men Pack-glb/Casual Character.glb",
+      "armature_filter": "CharacterArmature",
+      "scale": [2.5, 2.5, 2.5],
       "animation_sequence": [
-        {
-          "action_filter": "Man_Walk",
-          "start_second": 0,
-          "end_second": 6,
-          "start_position": [0, 8, 0],
-          "end_position": [0, 3, 0],
-          "start_rotation": [0, 0, 0],
-          "end_rotation": [0, 0, 0],
-          "interpolation": "LINEAR"
-        },
-        {
-          "action_filter": "Man_Idle",
-          "lower_body_lock": "Man_Sitting",
-          "start_second": 6,
-          "end_second": 12,
-          "start_position": [0, 3, 0],
-          "end_position": [0, 3, 0],
-          "start_rotation": [0, 0, 0],
-          "end_rotation": [0, 0, 0],
-          "interpolation": "CONSTANT"
-        }
+        {"action_filter": "Walk", "start_second": 0, "end_second": 6,
+         "start_position": [0, 8, 0], "end_position": [0, 3, 0],
+         "start_rotation": [0, 0, 0], "end_rotation": [0, 0, 0], "interpolation": "LINEAR"},
+        {"action_filter": "Interact", "speaks_first": true, "lower_body_lock": "Man_Sitting",
+         "start_second": 6, "end_second": 12,
+         "start_position": [0, 3, 0], "end_position": [0, 3, 0],
+         "start_rotation": [0, 0, 0], "end_rotation": [0, 0, 0], "interpolation": "CONSTANT"}
       ]
     }
   ],
-  "environment": {
-    "scattered_elements": [
-      {
-        "name": "LocationScene",
-        "asset_path": "assets/locations/Cozy Kitchen.glb",
-        "scale": [7.5, 7.5, 7.5],
-        "count": 1,
-        "random_seed": 1,
-        "scatter_area": {
-          "x_range": [0, 0],
-          "y_range": [0, 0],
-          "z_position": 0
-        }
-      }
-    ]
-  },
+  "environment": {"scattered_elements": [
+    {"name": "LocationScene", "asset_path": "assets/locations/Cozy Kitchen.glb",
+     "scale": [7.5, 7.5, 7.5], "count": 1, "random_seed": 1,
+     "scatter_area": {"x_range": [0, 0], "y_range": [0, 0], "z_position": 0}}]},
   "props": [
-    {
-      "name": "Pistol",
-      "asset_path": "assets/Ultimate Guns Pack-glb/Pistol.glb",
-      "scale": [0.20, 0.20, 0.20],
-      "attach_to": "CHARACTER_NAME",
-      "bone": "Palm.R",
-      "position_offset": [0, 0, 0],
-      "rotation_offset": [1.5708, 0, 0]
-    }
-  ],
-  "camera": {
-    "position": [7, 2, 3],
-    "rotation": [1.2, 0, 1.4],
-    "lens_mm": 35
-  },
-  "lighting": [
-    {"type": "SUN",   "position": [5, 5, 10], "energy": 3.0},
-    {"type": "POINT", "position": [0, 3, 4],  "energy": 800.0}
-  ]
+    {"name": "Pistol", "asset_path": "assets/Ultimate Guns Pack-glb/Pistol.glb",
+     "scale": [0.20, 0.20, 0.20], "attach_to": "CHARACTER_NAME", "bone": "Wrist.R",
+     "position_offset": [0, 0, 0], "rotation_offset": [1.5708, 0, 0]}],
+  "camera": {"position": [7, 2, 3], "rotation": [1.2, 0, 1.4], "lens_mm": 35},
+  "lighting": [{"type": "SUN", "position": [5, 5, 10], "energy": 3.0},
+               {"type": "POINT", "position": [0, 3, 4], "energy": 800.0}]
 }
-
 RULES:
-- Do NOT include a "base_surface" key. Pre-built location GLBs already have their own floors.
-- Only include "props" if characters are explicitly holding something. Omit the key entirely otherwise.
-- scale in scattered_elements: all three values equal the location's scale above.
-- interpolation: "LINEAR" when moving, "CONSTANT" when stationary, "BEZIER" when turning.
-- lower_body_lock: ONLY include when the character is seated AND doing something with their upper body.
-  Omit the key entirely for standing characters. Value must be "Man_Sitting" or "Female_Sitting".
-- Turning segment: 0.5–1s long, end_rotation Z differs by 3.14159, interpolation "BEZIER".
-- Camera rotation is in radians. Interior side-angle: roughly [1.2, 0, 1.4].
-- Pre-built location: count 1, scatter_area x_range [0,0], y_range [0,0].
-- Output ONLY raw valid JSON — no explanation, no markdown fences, nothing else.
+- No "base_surface" key (locations have floors). Omit "props" unless someone holds something.
+- interpolation: LINEAR when moving, CONSTANT when still, BEZIER when turning.
+- lower_body_lock only on seated segments; value "Man_Sitting" or "Female_Sitting".
+- People default to Ultimate Modular ("CharacterArmature", scale 2.5).
+- Dialogue: one Interact segment per participant per stretch of talk, first speaker marked
+  "speaks_first": true.
+- Camera rotation in radians (interior side angle ≈ [1.2, 0, 1.4]).
+- Output ONLY raw valid JSON — no explanation, no markdown fences.
 """
+
 
 
 class ScreenplayToScene:
@@ -379,7 +203,21 @@ class ScreenplayToScene:
     # Prompt                                                               #
     # ------------------------------------------------------------------ #
 
-    def _build_prompt(self, screenplay: str) -> str:
+    @staticmethod
+    def _direction_block(direction: str | None) -> str:
+        if not direction or not direction.strip():
+            return ""
+        return f"""
+=== DIRECTOR'S NOTES (FOLLOW THESE EXACTLY) ===
+
+{direction.strip()}
+
+These notes override the defaults above: use the characters, positions, beats and timings
+they give (e.g. "A and B talk for 3 s, then A turns away for 2 s, then B walks past A").
+Build the shared event timeline from these beats first, then fill in the dialogue turns.
+"""
+
+    def _build_prompt(self, screenplay: str, direction: str | None = None) -> str:
         return f"""You are a pre-visualization system that converts screenplay scenes into 3D Blender scene configurations.
 
 {ASSET_REFERENCE}
@@ -389,7 +227,7 @@ class ScreenplayToScene:
 === SCREENPLAY ===
 
 {screenplay}
-
+{self._direction_block(direction)}
 === TASK ===
 
 Analyze the screenplay and generate the complete JSON configuration.
@@ -398,7 +236,10 @@ Before writing JSON, reason through these steps in order:
 
 STEP 1 — LOCATION & CHARACTERS
   - Pick the best pre-built environment.
-  - Pick the best GLB and animation pack for each character.
+  - Pick each character's GLB: Ultimate Modular by default — Animated Woman /
+    Animated Woman-nIItLV9nxS for women; Casual, Hoodie, Beach Character for men —
+    unless the context calls for a costume (Business Man for an office, Witch for
+    witchcraft, Swat for police, ...). Give each character a different model.
 
 STEP 2 — SHARED EVENT TIMELINE
   - List every event and the EXACT second it happens.
@@ -427,6 +268,8 @@ STEP 5 — ANIMATION SEQUENCES
   - Fill all waiting time with Idle.
   - Rotation must be CONSISTENT: end_rotation of seg[i] = start_rotation of seg[i+1].
   - Only use EXACT animation names from the asset list above.
+  - Dialogue: one "Interact" segment per participant spanning each stretch of talk, with
+    "speaks_first": true on the first speaker's (the system splits it into turns).
 
 STEP 6 — PROPS
   - Only include props if a character is explicitly holding something in the scene.
@@ -450,6 +293,18 @@ Output ONLY the raw JSON object. No explanation. No markdown. Nothing else.
     _LOCATION_FLOOR_Z = {
         "cozy kitchen":  -3.7,
         # Other locations default to 0.0 — user adjusts manually in Blender if needed.
+    }
+
+    # Animated-pack clip (without Man_/Female_) → Ultimate Modular clip, and back.
+    _TO_MODULAR = {
+        "Idle": "Idle", "Walk": "Walk", "Run": "Run", "Death": "Death",
+        "Punch": "Punch_Right", "SwordSlash": "Sword_Slash", "Clapping": "Wave",
+        "Wave": "Wave", "Talk": "Interact", "Talking": "Interact", "Jump": "Idle",
+    }
+    _TO_ANIMATED = {
+        "Idle": "Idle", "Idle_Neutral": "Idle", "Walk": "Walk", "Run": "Run", "Death": "Death",
+        "Punch_Left": "Punch", "Punch_Right": "Punch", "Sword_Slash": "SwordSlash",
+        "Wave": "Clapping", "Interact": "Idle",
     }
 
     # Map of invented / incorrect animation names → correct names
@@ -490,6 +345,80 @@ Output ONLY the raw JSON object. No explanation. No markdown. Nothing else.
         "Man_Speak":         "Man_Idle",
     }
 
+    TALK_TURN_SECONDS = 0.75
+
+    @classmethod
+    def _split_dialogue_turns(cls, chars: list) -> None:
+        """
+        The LLM gives each participant one stationary "Interact" segment spanning a stretch
+        of conversation. Split those into alternating turns on a shared grid: in each
+        TALK_TURN_SECONDS slot one participant plays Interact and the others Idle, starting
+        with the segment marked "speaks_first" (else the first character listed).
+        A lone Interact segment (monologue) alternates Interact with short Idle beats.
+        """
+        T = cls.TALK_TURN_SECONDS
+        spans = []   # (char_index, seg_index, start, end)
+        for ci, char in enumerate(chars):
+            for si, seg in enumerate(char.get("animation_sequence", [])):
+                if (seg.get("action_filter") == "Interact"
+                        and seg.get("start_position") == seg.get("end_position")
+                        and seg.get("start_rotation") == seg.get("end_rotation")):
+                    spans.append((ci, si, float(seg["start_second"]), float(seg["end_second"])))
+        if not spans:
+            return
+
+        # group spans that overlap in time into conversations
+        spans.sort(key=lambda s: s[2])
+        groups, cur, cur_end = [], [], -1.0
+        for sp in spans:
+            if cur and sp[2] < cur_end - 1e-6:
+                cur.append(sp); cur_end = max(cur_end, sp[3])
+            else:
+                if cur:
+                    groups.append(cur)
+                cur, cur_end = [sp], sp[3]
+        groups.append(cur)
+
+        replace = {}  # (ci, si) -> list of new segments
+        for group in groups:
+            t0 = min(s[2] for s in group)
+            members = sorted({s[0] for s in group},
+                             key=lambda ci: (not any(chars[s[0]]["animation_sequence"][s[1]].get("speaks_first")
+                                                     for s in group if s[0] == ci), ci))
+            for ci, si, a, b in group:
+                seg = chars[ci]["animation_sequence"][si]
+                pieces, t = [], a
+                while t < b - 1e-6:
+                    k = int((t - t0 + 1e-6) // T)
+                    e = min(t0 + (k + 1) * T, b)
+                    if len(members) == 1:          # monologue: talk, pause, talk, ...
+                        talking = k % 3 != 2
+                    else:
+                        talking = members[k % len(members)] == ci
+                    piece = dict(seg, start_second=round(t, 3), end_second=round(e, 3),
+                                 action_filter="Interact" if talking else "Idle")
+                    piece.pop("speaks_first", None)
+                    pieces.append(piece)
+                    t = e
+                # merge consecutive pieces with the same action
+                merged = []
+                for p in pieces:
+                    if merged and merged[-1]["action_filter"] == p["action_filter"]:
+                        merged[-1]["end_second"] = p["end_second"]
+                    else:
+                        merged.append(p)
+                replace[(ci, si)] = merged
+            names = [chars[m]["name"] for m in members]
+            print(f"  🔧 Dialogue turns: {' / '.join(names)} alternate every {T}s "
+                  f"from {t0:.2f}s to {max(s[3] for s in group):.2f}s")
+
+        for ci, char in enumerate(chars):
+            seq = char.get("animation_sequence", [])
+            new_seq = []
+            for si, seg in enumerate(seq):
+                new_seq.extend(replace.get((ci, si), [seg]))
+            char["animation_sequence"] = new_seq
+
     def _postprocess(self, data: dict) -> dict:
         """Auto-correct common LLM errors in generated JSON."""
         chars = data.get("characters", [])
@@ -518,14 +447,50 @@ Output ONLY the raw JSON object. No explanation. No markdown. Nothing else.
                     for key in ["start_position", "end_position"]:
                         seg[key][2] += floor_z
 
-        # 1. Fix invented animation names
+        # 1. Fix invented animation names (Animated packs; Ultimate Modular is handled in 1b)
         for char in chars:
+            if "Ultimate Modular" in char.get("asset_path", "") or char.get("armature_filter") == "CharacterArmature":
+                continue
             for seg in char.get("animation_sequence", []):
                 af = seg.get("action_filter", "")
                 if af in self._ANIM_FIXUPS:
                     fixed = self._ANIM_FIXUPS[af]
                     print(f"  🔧 Auto-fixed animation: '{af}' → '{fixed}' ({char['name']})")
                     seg["action_filter"] = fixed
+
+        # 1b. Make animation names match the character's pack (the two packs name clips
+        #     differently; a wrong-pack name silently leaves the character frozen).
+        for char in chars:
+            modular = ("Ultimate Modular" in char.get("asset_path", "")
+                       or char.get("armature_filter") == "CharacterArmature")
+            if modular:
+                char["armature_filter"] = "CharacterArmature"
+                if char.get("scale") in (None, [1, 1, 1], [1.0, 1.0, 1.0]):
+                    char["scale"] = [2.5, 2.5, 2.5]
+                    print(f"  🔧 Set Ultimate Modular scale 2.5 ({char['name']})")
+            female = "Wom" in char.get("asset_path", "")
+            prefix = "Female_" if female else "Man_"
+            for seg in char.get("animation_sequence", []):
+                af = seg.get("action_filter", "")
+                fixed = af
+                if modular and af.startswith(("Man_", "Female_")):
+                    base = af.split("_", 1)[1]
+                    if base == "Sitting":
+                        seg["lower_body_lock"] = af
+                        fixed = "Idle"
+                    else:
+                        fixed = self._TO_MODULAR.get(base, "Idle")
+                elif not modular and not af.startswith(("Man_", "Female_")):
+                    fixed = prefix + self._TO_ANIMATED.get(af, "Idle")
+                if fixed != af:
+                    print(f"  🔧 Pack-matched animation: '{af}' → '{fixed}' ({char['name']})")
+                    seg["action_filter"] = fixed
+                lbl = seg.get("lower_body_lock")
+                if lbl and lbl not in ("Man_Sitting", "Female_Sitting"):
+                    seg["lower_body_lock"] = prefix + "Sitting"
+
+        # 1c. Turn-taking dialogue: split overlapping "Interact" spans into alternating turns
+        self._split_dialogue_turns(chars)
 
         # 2. Fix character X overlap (same X position)
         x_positions = {}
@@ -757,13 +722,13 @@ Output ONLY the raw JSON object. No explanation. No markdown. Nothing else.
     # Pipeline                                                             #
     # ------------------------------------------------------------------ #
 
-    def generate_json(self, screenplay: str) -> dict | None:
-        print("\n📜 Sending screenplay to Groq...")
+    def generate_json(self, screenplay: str, direction: str | None = None) -> dict | None:
+        print("\n📜 Sending screenplay to the LLM..." + (" (with director's notes)" if direction else ""))
 
         for attempt in range(1, 4):
             try:
                 print(f"  🤖 Attempt {attempt}/3")
-                raw  = self.llm.call(self._build_prompt(screenplay))
+                raw  = self.llm.call(self._build_prompt(screenplay, direction))
                 data = self._extract_json(raw)
                 if data:
                     print("  ✅ Valid JSON received")

@@ -16,7 +16,7 @@ Screenplay Text / PDF / .txt / .fountain
         │screenplay_to_   │
         │  scene.py       │
         └───────┬────────┘
-                │  sends screenplay + README asset lists
+                │  sends screenplay + ASSET_REFERENCE (+ --direction notes)
                 ▼
         ┌───────────────┐
         │  LLM Backend  │  (Groq / Anthropic / Gemini / OpenAI)
@@ -92,17 +92,19 @@ Screenplay Text / PDF / .txt / .fountain
 
 ## Data Sources: What Comes From Where
 
-### README.md → LLM Prompt (Phase 1)
+### ASSET_REFERENCE → LLM Prompt (Phase 1)
 
-`screenplay_to_scene.py` reads `README.md` at runtime and injects into the LLM system prompt:
+`screenplay_to_scene.py` builds the Phase 1 prompt from constants in the file itself (it does
+**not** read `README.md`):
 
-- Complete asset folder structure (all available GLB paths)
-- Scaling guidelines per pack
-- Animation name lists per character type
-- Location-specific asset recommendations
-- JSON schema and critical formatting rules
+- `ASSET_REFERENCE`: character packs with default / costume picks, exact animation names,
+  sitting via `lower_body_lock`, the turn-taking dialogue rules, locations, props and grip bones,
+  and the coordinate, timing and rotation rules
+- `JSON_FORMAT`: the JSON schema and formatting rules
+- optional **director's notes** (`pipeline.py --direction`) with blocking and beat timings
 
-This means **updating README.md automatically updates what the LLM can generate** — no code changes needed to add new asset packs.
+So **adding a new asset pack means updating `ASSET_REFERENCE`** (and the README for people).
+Phase 2 similarly takes an optional plain-language shot list (`--shotlist`).
 
 ### scene.json → Blender (Phase 1 → Phase 1 execution)
 
@@ -150,7 +152,7 @@ for backend in AUTO_ORDER:
 ```
 
 Override with CLI: `--backend groq` / `--backend anthropic` etc.  
-Override model: `export GROQ_MODEL=llama-3.1-8b-instant`
+Override model: `export GROQ_MODEL=openai/gpt-oss-20b`
 
 ---
 

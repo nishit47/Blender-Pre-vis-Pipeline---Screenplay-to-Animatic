@@ -181,6 +181,11 @@ RULES:
 - TILT                → tilt_start_z, tilt_end_z  (world Z target height)
 - CRANE               → crane_start_z, crane_end_z  (camera world Z)
 - ORBIT               → orbit_radius, orbit_start_angle, orbit_end_angle, orbit_height
+- Optional on STATIC / PUSH shots: height_offset (camera height above the aim point; raise it
+  to see over counters or tables in cramped sets).
+- Optional on any shot: movement_end_second (the move finishes early, camera then holds)
+  and pan_to + pan_start_second + pan_end_second (camera stays put and turns from its
+  subject to another character, e.g. follow someone out, then settle on who they left).
 - Cover every second from 0 to scene duration.
 - Output ONLY raw valid JSON — no explanation, no markdown fences.
 """
@@ -267,7 +272,7 @@ class CameraSetup:
     # LLM prompt                                                           #
     # ------------------------------------------------------------------ #
 
-    def _build_prompt(self, screenplay: str | None, scene_json: dict) -> str:
+    def _build_prompt(self, screenplay: str | None, scene_json: dict, direction: str | None = None) -> str:
         chars    = scene_json.get("characters", [])
         duration = scene_json.get("scene", {}).get("duration_seconds", 10)
         fps      = scene_json.get("scene", {}).get("frame_rate", 24)
@@ -301,7 +306,33 @@ Use these EXACT seconds as cut points — they are when something notable happen
 {chr(10).join(beat_lines) if beat_lines else "  (no events)"}
 
 {f"=== SCREENPLAY ==={chr(10)}{screenplay}{chr(10)}" if screenplay and screenplay.strip() else ""}
+{self._shotlist_task(direction, duration) if direction and direction.strip() else self._default_task(duration, len(events))}
+Output ONLY the raw JSON object. No explanation.
+"""
+
+    @staticmethod
+    def _shotlist_task(direction: str, duration) -> str:
+        return f"""=== DIRECTOR'S SHOT LIST (FOLLOW EXACTLY) ===
+
+{direction.strip()}
+
 === YOUR TASK ===
+
+Turn the director's shot list above into camera_shots JSON:
+1. Produce EXACTLY one camera_shots entry per shot the director describes, in the same order.
+   Do NOT add extra shots, cutaways or reaction shots, and do NOT split a described shot into
+   several. A shot that lasts "while they talk" or "until the end" stays ONE entry.
+2. Time each cut to the beat the director references, using the ANIMATION BEAT TIMELINE
+   (e.g. "until he arrives" = the second his Walk ends; "when she gets up" = her first
+   non-seated segment).
+3. "Follow" / "track" / "move with" = TRUCK on that character. "Settle on" / "end on" someone
+   after following another = add pan_to with that character.
+4. Cover EVERY second from 0 to {duration} with no gaps or overlaps.
+"""
+
+    @staticmethod
+    def _default_task(duration, n_events: int) -> str:
+        return f"""=== YOUR TASK ===
 
 Design a complete multi-camera shot list. Think like a film director:
 
@@ -315,21 +346,19 @@ Design a complete multi-camera shot list. Think like a film director:
 4. For two characters talking: alternate angle=0° on one and angle=180° on the other.
 5. Add movement sparingly — 1 or 2 moving shots max; rest can be STATIC.
 6. Cover EVERY second from 0 to {duration}.
-7. Aim for {max(5, min(10, len(events) + 3))} shots total.
-
-Output ONLY the raw JSON object. No explanation.
+7. Aim for {max(5, min(10, n_events + 3))} shots total.
 """
 
     # ------------------------------------------------------------------ #
     # LLM call                                                             #
     # ------------------------------------------------------------------ #
 
-    def generate_shots_json(self, screenplay: str | None, scene_json: dict) -> dict | None:
-        print("\n🎬 Planning camera shots with AI...")
+    def generate_shots_json(self, screenplay: str | None, scene_json: dict, direction: str | None = None) -> dict | None:
+        print("\n🎬 Planning camera shots with AI..." + (" (following the director's shot list)" if direction else ""))
         for attempt in range(1, 4):
             try:
                 print(f"  🤖 Attempt {attempt}/3")
-                raw  = self.llm.call(self._build_prompt(screenplay, scene_json), max_tokens=4096)
+                raw  = self.llm.call(self._build_prompt(screenplay, scene_json, direction), max_tokens=4096)
                 data = self._extract_json(raw)
                 if data:
                     print(f"  ✅ {len(data['camera_shots'])} shots planned")
@@ -358,22 +387,34 @@ Output ONLY the raw JSON object. No explanation.
             f"fps      = {fps}",
             f"scene    = bpy.context.scene",
             f"scene.frame_start = 1",
-            f"scene.frame_end   = {duration} * fps",
+            f"scene.frame_end   = int(round({duration} * fps))",
             "",
             f"TARGET_HEIGHT      = {self.TARGET_HEIGHT}",
             f"COMPOSITION_FACTOR = {self.COMPOSITION_FACTOR}",
             f"SHOT_DISTANCES     = {self.SHOT_DISTANCES}",
             f"SHOT_H_OFFSETS     = {self.SHOT_HEIGHT_OFFSETS}",
             "",
+            "# Where to aim on a character, as a fraction of feet→eyes, per shot type.",
+            "AIM_FRAC = {'ECU': 1.0, 'CU': 1.0, 'MCU': 0.93, 'MS': 0.8, 'WA': 0.6, 'LOW': 0.85, 'OVR': 0.6}",
+            "AIM_SHOT = 'MS'   # set per shot below",
+            "",
             "# ── Helpers ─────────────────────────────────────────────",
             "def get_subject_loc(subject):",
             "    # Use evaluated depsgraph so we read the ACTUAL position after NLA",
             "    # and any manual keyframe edits the user made after Phase 1.",
+            "    # For characters, z is shifted so that z + TARGET_HEIGHT lands on the",
+            "    # current shot's aim point (from the Head bone), which follows the",
+            "    # character's real size and whether they are sitting or standing.",
             "    dg = bpy.context.evaluated_depsgraph_get()",
             "    def _eval_loc(name):",
             "        obj = bpy.data.objects.get(name)",
             "        if obj is None: return None",
-            "        return obj.evaluated_get(dg).matrix_world.translation.copy()",
+            "        loc = obj.evaluated_get(dg).matrix_world.translation.copy()",
+            "        head = obj.pose.bones.get('Head') if obj.type == 'ARMATURE' else None",
+            "        if head:",
+            "            eyes = obj.matrix_world @ ((head.head + head.tail) / 2)",
+            "            loc.z += AIM_FRAC.get(AIM_SHOT, 0.8) * (eyes.z - loc.z) - TARGET_HEIGHT",
+            "        return loc",
             "    if isinstance(subject, list):",
             "        locs = [_eval_loc(n) for n in subject if _eval_loc(n) is not None]",
             "        if not locs: return mathutils.Vector((0,0,0))",
@@ -398,17 +439,85 @@ Output ONLY the raw JSON object. No explanation.
             "    look.location = (loc.x, loc.y, loc.z + TARGET_HEIGHT)",
             "    return look",
             "",
+            "def shot_angle(subject, angle_deg):",
+            "    # ANGLE CONVENTION: angles are relative to the way the subject faces",
+            "    # (0 = in front, 90 = their right). Returns the world angle used by the",
+            "    # placement formulas (camera at dist*(sin a, -cos a) from the subject).",
+            "    # Two subjects facing each other are shot side-on to the pair.",
+            "    dg = bpy.context.evaluated_depsgraph_get()",
+            "    fwds, locs = [], []",
+            "    for n in (subject if isinstance(subject, list) else [subject]):",
+            "        o = bpy.data.objects.get(n)",
+            "        if o is None or o.type != 'ARMATURE': continue",
+            "        m = o.evaluated_get(dg).matrix_world",
+            "        f = m.to_3x3().normalized() @ mathutils.Vector((0, 0, -1))  # GLB rig forward",
+            "        f.z = 0",
+            "        if f.length > 1e-6:",
+            "            fwds.append(f.normalized()); locs.append(m.translation.copy())",
+            "    if not fwds:",
+            "        return radians(angle_deg)",
+            "    s = mathutils.Vector((0, 0, 0))",
+            "    for f in fwds: s += f",
+            "    if s.length < 0.3 and len(locs) == 2:",
+            "        d = locs[1] - locs[0]; s = mathutils.Vector((-d.y, d.x, 0))",
+            "    return math.atan2(s.y, s.x) + pi / 2 - radians(angle_deg)",
+            "",
             "def add_track_to(cam, look):",
             "    for c in list(cam.constraints): cam.constraints.remove(c)",
             "    t = cam.constraints.new('TRACK_TO')",
             "    t.target = look; t.track_axis = 'TRACK_NEGATIVE_Z'; t.up_axis = 'UP_Y'",
             "",
-            "def place_static(cam, subject, shot_type, composition, angle_deg):",
+            "def _part_of(obj, names):",
+            "    while obj is not None:",
+            "        if obj.name in names: return True",
+            "        obj = obj.parent",
+            "    return False",
+            "",
+            "def clearance(target, cam_pos, subject):",
+            "    # Free distance from the subject's aim point toward cam_pos before a wall or",
+            "    # prop gets in the way (the subject's own body is ignored).",
+            "    names = set(subject if isinstance(subject, list) else [subject])",
+            "    dg = bpy.context.evaluated_depsgraph_get()",
+            "    d = cam_pos - target; full = d.length",
+            "    if full < 1e-6: return full",
+            "    d.normalize(); origin = target.copy(); travelled = 0.0",
+            "    for _ in range(32):",
+            "        hit, hit_loc, _n, _i, obj, _m = scene.ray_cast(dg, origin, d, distance=full - travelled)",
+            "        if not hit: return full",
+            "        travelled += (hit_loc - origin).length",
+            "        if not _part_of(obj, names): return travelled",
+            "        origin = hit_loc + d * 0.01; travelled += 0.01",
+            "    return full",
+            "",
+            "CLEAR_MARGIN = 0.3",
+            "",
+            "def clear_angle(subject, angle_deg, dist, hoff):",
+            "    # The requested angle if the camera has a clear line to the subject, else the",
+            "    # nearest angle that does (or the one with the most room). Returns (angle,",
+            "    # usable distance) — callers pull the camera in to the usable distance.",
+            "    loc = get_subject_loc(subject)",
+            "    target = mathutils.Vector((loc.x, loc.y, loc.z + TARGET_HEIGHT))",
+            "    base = shot_angle(subject, angle_deg)",
+            "    best = None",
+            "    for off in (0, 25, -25, 50, -50, 75, -75, 100, -100, 130, -130):",
+            "        ar = base + radians(off)",
+            "        pos = target + mathutils.Vector((dist * sin(ar), -dist * cos(ar), hoff))",
+            "        room = clearance(target, pos, subject) - CLEAR_MARGIN",
+            "        if room >= dist - CLEAR_MARGIN - 1e-3:   # tolerance: a clear line returns ~dist",
+            "            return ar, dist",
+            "        if best is None or room > best[1]:",
+            "            best = (ar, room)",
+            "    return best[0], max(best[1], 0.5)",
+            "",
+            "def place_static(cam, subject, shot_type, composition, angle_deg, hoff=None):",
             "    bpy.context.view_layer.update()",
             "    loc  = get_subject_loc(subject)",
             "    dist = SHOT_DISTANCES.get(shot_type, 4.0)",
-            "    hoff = SHOT_H_OFFSETS.get(shot_type, 0.0)",
-            "    ar   = radians(angle_deg)",
+            "    hoff = SHOT_H_OFFSETS.get(shot_type, 0.0) if hoff is None else hoff",
+            "    want = dist",
+            "    ar, dist = clear_angle(subject, angle_deg, dist, hoff)",
+            "    # Pulled in by a wall: widen the lens so the framing still holds.",
+            "    cam.data.lens = max(16.0, cam.data.lens * min(1.0, dist / want))",
             "    xoff = COMPOSITION_FACTOR * dist * (",
             "        1.0 if composition=='RIGHT' else -1.0 if composition=='LEFT' else 0.0)",
             "    ox, oy = cos(ar), sin(ar)",
@@ -418,7 +527,10 @@ Output ONLY the raw JSON object. No explanation.
             "",
             "def set_bezier(cam, start_f, end_f):",
             "    if cam.animation_data and cam.animation_data.action:",
-            "        for fc in cam.animation_data.action.fcurves:",
+            "        act = cam.animation_data.action",
+            "        fcs = act.fcurves if hasattr(act, 'fcurves') else [  # Blender 5.x slotted actions",
+            "            fc for l in act.layers for s in l.strips for b in s.channelbags for fc in b.fcurves]",
+            "        for fc in fcs:",
             "            for kp in fc.keyframe_points:",
             "                kp.interpolation = 'BEZIER'",
             "",
@@ -442,12 +554,26 @@ Output ONLY the raw JSON object. No explanation.
             end_s       = shot.get("end_second", 10)
             sf          = int(start_s * fps) + 1
             ef          = int(end_s   * fps)
+            # A camera move may finish before the shot ends (e.g. follow, then hold).
+            mef         = min(ef, int(shot.get("movement_end_second", end_s) * fps))
             subj_repr   = repr(subject)
             look_name   = f"LookAt_{name}"
+            # Aim at where the subject is during THIS shot, not at frame 1 — characters
+            # that walked earlier in the scene are elsewhere by now. Moves that start
+            # from a framing use the first frame; held framings use the middle.
+            eval_f      = sf if movement in ("PUSH_IN", "PUSH_OUT", "TRUCK") else (sf + ef) // 2
+            aim_type    = shot_type
+            if movement in ("PUSH_IN", "PUSH_OUT") and min(shot.get("start_distance", 99),
+                                                        shot.get("end_distance", 99)) <= 2.0:
+                aim_type = "CU"
 
             lines += [
                 "",
                 f"# ── {name} ──",
+                f"scene.frame_set({eval_f})",
+                f"bpy.context.view_layer.update()",
+                # A push that ends close is a close-up by the end: frame the eyes.
+                f"AIM_SHOT = '{aim_type}'",
                 f"_subj_{i} = {subj_repr}",
                 f"_cd_{i}   = bpy.data.cameras.new('{name}')",
                 f"_cd_{i}.lens = 35",
@@ -459,28 +585,32 @@ Output ONLY the raw JSON object. No explanation.
 
             if movement == "STATIC":
                 lines += [
-                    f"place_static(_cam_{i}, _subj_{i}, '{shot_type}', '{composition}', {angle})",
+                    f"place_static(_cam_{i}, _subj_{i}, '{shot_type}', '{composition}', {angle}, {shot.get('height_offset')!r})",
                     f"add_track_to(_cam_{i}, _look_{i})",
                 ]
 
             elif movement in ("PUSH_IN", "PUSH_OUT"):
                 sd = shot.get("start_distance", self.SHOT_DISTANCES.get(shot_type, 4.0))
                 ed = shot.get("end_distance",   self.SHOT_DISTANCES.get(shot_type, 4.0) * 0.5)
-                ho = self.SHOT_HEIGHT_OFFSETS.get(shot_type, 0.0)
+                ho = shot.get("height_offset", self.SHOT_HEIGHT_OFFSETS.get(shot_type, 0.0))
+                # Keep the whole dolly inside the set: pick a clear angle for the far end
+                # and scale both ends down if the room is shorter than the move.
                 lines += [
-                    f"_ar_{i}  = radians({angle})",
+                    f"_ar_{i}, _room_{i} = clear_angle(_subj_{i}, {angle}, {max(sd, ed)}, {ho})",
+                    f"_k_{i}   = min(1.0, _room_{i} / {max(sd, ed)})",
+                    f"_cd_{i}.lens = max(16.0, _cd_{i}.lens * _k_{i})",
                     f"_sl_{i}  = get_subject_loc(_subj_{i})",
-                    f"_sx_{i}  = {sd} * sin(_ar_{i}) + _sl_{i}.x",
-                    f"_sy_{i}  = -{sd} * cos(_ar_{i}) + _sl_{i}.y",
-                    f"_ex_{i}  = {ed} * sin(_ar_{i}) + _sl_{i}.x",
-                    f"_ey_{i}  = -{ed} * cos(_ar_{i}) + _sl_{i}.y",
+                    f"_sx_{i}  = {sd} * _k_{i} * sin(_ar_{i}) + _sl_{i}.x",
+                    f"_sy_{i}  = -{sd} * _k_{i} * cos(_ar_{i}) + _sl_{i}.y",
+                    f"_ex_{i}  = {ed} * _k_{i} * sin(_ar_{i}) + _sl_{i}.x",
+                    f"_ey_{i}  = -{ed} * _k_{i} * cos(_ar_{i}) + _sl_{i}.y",
                     f"_cz_{i}  = TARGET_HEIGHT + {ho} + _sl_{i}.z",
                     f"add_track_to(_cam_{i}, _look_{i})",
                     f"_cam_{i}.location = (_sx_{i}, _sy_{i}, _cz_{i})",
                     f"_cam_{i}.keyframe_insert(data_path='location', frame={sf})",
                     f"_cam_{i}.location = (_ex_{i}, _ey_{i}, _cz_{i})",
-                    f"_cam_{i}.keyframe_insert(data_path='location', frame={ef})",
-                    f"set_bezier(_cam_{i}, {sf}, {ef})",
+                    f"_cam_{i}.keyframe_insert(data_path='location', frame={mef})",
+                    f"set_bezier(_cam_{i}, {sf}, {mef})",
                 ]
 
             elif movement == "TRUCK":
@@ -488,14 +618,22 @@ Output ONLY the raw JSON object. No explanation.
                 tx1 = shot.get("truck_end_x",    0.0)
                 td  = shot.get("truck_depth",     4.0)
                 th  = shot.get("truck_height",    self.TARGET_HEIGHT)
+                # Follow the subject: camera and look-at are keyed at the subject's
+                # position at the shot's first and last frame.
                 lines += [
                     f"_sl_{i} = get_subject_loc(_subj_{i})",
+                    f"scene.frame_set({mef}); bpy.context.view_layer.update()",
+                    f"_sl1_{i} = get_subject_loc(_subj_{i})",
                     f"add_track_to(_cam_{i}, _look_{i})",
-                    f"_cam_{i}.location = ({tx0} + _sl_{i}.x, {td} + _sl_{i}.y, {th})",
+                    f"_cam_{i}.location = ({tx0} + _sl_{i}.x, {td} + _sl_{i}.y, {th} + _sl_{i}.z)",
                     f"_cam_{i}.keyframe_insert(data_path='location', frame={sf})",
-                    f"_cam_{i}.location = ({tx1} + _sl_{i}.x, {td} + _sl_{i}.y, {th})",
-                    f"_cam_{i}.keyframe_insert(data_path='location', frame={ef})",
-                    f"set_bezier(_cam_{i}, {sf}, {ef})",
+                    f"_cam_{i}.location = ({tx1} + _sl1_{i}.x, {td} + _sl1_{i}.y, {th} + _sl1_{i}.z)",
+                    f"_cam_{i}.keyframe_insert(data_path='location', frame={mef})",
+                    f"_look_{i}.location = (_sl_{i}.x, _sl_{i}.y, _sl_{i}.z + TARGET_HEIGHT)",
+                    f"_look_{i}.keyframe_insert(data_path='location', frame={sf})",
+                    f"_look_{i}.location = (_sl1_{i}.x, _sl1_{i}.y, _sl1_{i}.z + TARGET_HEIGHT)",
+                    f"_look_{i}.keyframe_insert(data_path='location', frame={mef})",
+                    f"set_bezier(_cam_{i}, {sf}, {mef})",
                 ]
 
             elif movement == "PAN":
@@ -531,17 +669,20 @@ Output ONLY the raw JSON object. No explanation.
                 tz0 = shot.get("tilt_start_z", self.TARGET_HEIGHT)
                 tz1 = shot.get("tilt_end_z",   0.5)
                 dist = self.SHOT_DISTANCES.get(shot_type, 4.0)
+                # Heights are relative to the subject (TARGET_HEIGHT = its aim point), so
+                # tilts work on raised ground too.
                 lines += [
                     f"_sl_{i}  = get_subject_loc(_subj_{i})",
-                    f"_ar_{i}  = radians({angle})",
-                    f"_cam_{i}.location = ({dist}*sin(_ar_{i})+_sl_{i}.x,",
-                    f"                     -{dist}*cos(_ar_{i})+_sl_{i}.y,",
-                    f"                     ({tz0}+{tz1})/2.0)",
+                    f"_ar_{i}, _d_{i} = clear_angle(_subj_{i}, {angle}, {dist}, ({tz0}+{tz1})/2.0 - TARGET_HEIGHT)",
+                    f"_cd_{i}.lens = max(16.0, _cd_{i}.lens * min(1.0, _d_{i} / {dist}))",
+                    f"_cam_{i}.location = (_d_{i}*sin(_ar_{i})+_sl_{i}.x,",
+                    f"                     -_d_{i}*cos(_ar_{i})+_sl_{i}.y,",
+                    f"                     ({tz0}+{tz1})/2.0 + _sl_{i}.z)",
                     # Look-at empty animates from tilt_start_z to tilt_end_z
                     f"_look_{i}.parent = None",
-                    f"_look_{i}.location = (_sl_{i}.x, _sl_{i}.y, {tz0})",
+                    f"_look_{i}.location = (_sl_{i}.x, _sl_{i}.y, {tz0} + _sl_{i}.z)",
                     f"_look_{i}.keyframe_insert(data_path='location', frame={sf})",
-                    f"_look_{i}.location = (_sl_{i}.x, _sl_{i}.y, {tz1})",
+                    f"_look_{i}.location = (_sl_{i}.x, _sl_{i}.y, {tz1} + _sl_{i}.z)",
                     f"_look_{i}.keyframe_insert(data_path='location', frame={ef})",
                     f"add_track_to(_cam_{i}, _look_{i})",
                     f"set_bezier(_cam_{i}, {sf}, {ef})",
@@ -551,15 +692,17 @@ Output ONLY the raw JSON object. No explanation.
                 cz0  = shot.get("crane_start_z", 1.0)
                 cz1  = shot.get("crane_end_z",   self.TARGET_HEIGHT)
                 dist = self.SHOT_DISTANCES.get(shot_type, 4.0)
+                # Heights are relative to the subject, like TILT.
                 lines += [
                     f"_sl_{i} = get_subject_loc(_subj_{i})",
-                    f"_ar_{i} = radians({angle})",
+                    f"_ar_{i}, _d_{i} = clear_angle(_subj_{i}, {angle}, {dist}, max({cz0}, {cz1}) - TARGET_HEIGHT)",
+                    f"_cd_{i}.lens = max(16.0, _cd_{i}.lens * min(1.0, _d_{i} / {dist}))",
                     f"add_track_to(_cam_{i}, _look_{i})",
-                    f"_cam_{i}.location = ({dist}*sin(_ar_{i})+_sl_{i}.x,",
-                    f"                     -{dist}*cos(_ar_{i})+_sl_{i}.y, {cz0})",
+                    f"_cam_{i}.location = (_d_{i}*sin(_ar_{i})+_sl_{i}.x,",
+                    f"                     -_d_{i}*cos(_ar_{i})+_sl_{i}.y, {cz0} + _sl_{i}.z)",
                     f"_cam_{i}.keyframe_insert(data_path='location', frame={sf})",
-                    f"_cam_{i}.location = ({dist}*sin(_ar_{i})+_sl_{i}.x,",
-                    f"                     -{dist}*cos(_ar_{i})+_sl_{i}.y, {cz1})",
+                    f"_cam_{i}.location = (_d_{i}*sin(_ar_{i})+_sl_{i}.x,",
+                    f"                     -_d_{i}*cos(_ar_{i})+_sl_{i}.y, {cz1} + _sl_{i}.z)",
                     f"_cam_{i}.keyframe_insert(data_path='location', frame={ef})",
                     f"set_bezier(_cam_{i}, {sf}, {ef})",
                 ]
@@ -601,6 +744,21 @@ Output ONLY the raw JSON object. No explanation.
                     f"add_track_to(_cam_{i}, _look_{i})",
                 ]
 
+            pan_to = shot.get("pan_to")
+            if pan_to:
+                p0 = int(shot.get("pan_start_second", mef / fps) * fps) + 1
+                p1 = max(p0 + 1, int(shot.get("pan_end_second", p0 / fps + 0.8) * fps))
+                lines += [
+                    f"# pan: camera holds, aim moves from the current subject to {pan_to}",
+                    f"scene.frame_set({p0}); bpy.context.view_layer.update()",
+                    f"_look_{i}.keyframe_insert(data_path='location', frame={p0})",
+                    f"AIM_SHOT = '{shot.get('pan_to_shot_type', shot_type)}'",
+                    f"scene.frame_set({p1}); bpy.context.view_layer.update()",
+                    f"_pl_{i} = get_subject_loc({pan_to!r})",
+                    f"_look_{i}.location = (_pl_{i}.x, _pl_{i}.y, _pl_{i}.z + TARGET_HEIGHT)",
+                    f"_look_{i}.keyframe_insert(data_path='location', frame={p1})",
+                ]
+
             lines += [
                 f"_mk_{i} = scene.timeline_markers.new('{name}', frame={sf})",
                 f"_mk_{i}.camera = _cam_{i}",
@@ -609,6 +767,7 @@ Output ONLY the raw JSON object. No explanation.
 
         lines += [
             "",
+            "scene.frame_set(1)",
             "scene.camera = _cam_0",
             f"bpy.ops.wm.save_as_mainfile(filepath=r'{output_blend}')",
             "print('✅ Cameras saved.')",
@@ -628,6 +787,7 @@ Output ONLY the raw JSON object. No explanation.
         blend_out:     str  = None,
         shots_json_in: str  = None,
         cameras_only:  bool = False,
+        direction:     str  = None,
     ) -> bool:
         blend_in  = str(Path(blend_in).absolute())
         blend_out = blend_out or blend_in.replace(".blend", "_cameras.blend")
@@ -637,10 +797,10 @@ Output ONLY the raw JSON object. No explanation.
             with open(shots_json_in) as f:
                 shots_data = json.load(f)
         else:
-            shots_data = self.generate_shots_json(screenplay, scene_json)
+            shots_data = self.generate_shots_json(screenplay, scene_json, direction)
             if not shots_data:
                 return False
-            shots_json_out = blend_out.replace(".blend", "_cameras.json")
+            shots_json_out = re.sub(r"(_cameras)?\.blend$", "_cameras.json", blend_out)
             with open(shots_json_out, "w") as f:
                 json.dump(shots_data, f, indent=2)
             print(f"💾 Camera shots saved: {shots_json_out}")
@@ -667,7 +827,7 @@ Output ONLY the raw JSON object. No explanation.
         print(f"\n🎬 Adding cameras to: {blend_in}")
         try:
             result = subprocess.run(
-                [blender_path, "--background", blend_in, "--python", script_path],
+                [blender_path, "--background", blend_in, "--python-exit-code", "1", "--python", script_path],
                 capture_output=True, text=True, timeout=300,
             )
             if os.path.exists(script_path):
